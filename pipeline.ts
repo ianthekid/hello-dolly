@@ -533,12 +533,10 @@ Do NOT eyeball the colors. Fetch the truth:
   enough to build from without re-reading the CSS.
 
 ### Phase 2 — Scaffold
-Create \`app/\` by hand (do NOT run create-next-app; it is interactive and slow):
-- \`package.json\`: deps next@^15, react@^19, react-dom@^19; devDeps typescript, @types/react,
-  @types/node, tailwindcss@^4, @tailwindcss/postcss. Scripts dev/build/start.
-- \`next.config.ts\`: \`export default { output: 'export', images: { unoptimized: true } }\`
-- \`postcss.config.mjs\`: \`export default { plugins: { '@tailwindcss/postcss': {} } }\`
-- \`tsconfig.json\`: standard Next.js app-router config with the \`@/*\` alias and the \`next\` plugin.
+\`app/package.json\`, \`app/next.config.ts\`, \`app/postcss.config.mjs\` and \`app/tsconfig.json\`
+already exist — do NOT recreate, edit or reformat them (do NOT run create-next-app either; it is
+interactive and slow). In particular, leave \`next.config.ts\`'s \`output: 'export'\` alone; the
+export-completeness check and the local preview server both depend on it. Your job in this phase:
 - \`src/app/globals.css\`: \`@import "tailwindcss";\` then an \`@theme\` block defining the color and
   font tokens from \`source/design-tokens.md\` verbatim, plus the \`@keyframes\` you extracted.
 - Fonts via \`next/font/google\` in the root layout — closest match to the real font stack.
@@ -586,6 +584,80 @@ still clean.
 Report at the end: routes built, images downloaded, anything you could not reproduce, build status.`;
 }
 
+// Boilerplate the orchestrator prompt used to spell out in full and pay Opus to retype every
+// run. Nothing here depends on the crawled site — that stays the agent's job (globals.css,
+// fonts, layout.tsx, components).
+const SCAFFOLD_PACKAGE_JSON = {
+  name: 'clone',
+  private: true,
+  version: '0.1.0',
+  scripts: {
+    dev: 'next dev',
+    build: 'next build',
+    start: 'next start',
+  },
+  dependencies: {
+    next: '^15',
+    react: '^19',
+    'react-dom': '^19',
+  },
+  devDependencies: {
+    typescript: '^5',
+    '@types/react': '^19',
+    '@types/node': '^22',
+    tailwindcss: '^4',
+    '@tailwindcss/postcss': '^4',
+  },
+};
+
+const SCAFFOLD_NEXT_CONFIG = `export default { output: 'export', images: { unoptimized: true } };\n`;
+
+const SCAFFOLD_POSTCSS_CONFIG = `export default { plugins: { '@tailwindcss/postcss': {} } };\n`;
+
+const SCAFFOLD_TSCONFIG = {
+  compilerOptions: {
+    target: 'ES2017',
+    lib: ['dom', 'dom.iterable', 'esnext'],
+    allowJs: true,
+    skipLibCheck: true,
+    strict: true,
+    noEmit: true,
+    esModuleInterop: true,
+    module: 'esnext',
+    moduleResolution: 'bundler',
+    resolveJsonModule: true,
+    isolatedModules: true,
+    jsx: 'preserve',
+    incremental: true,
+    plugins: [{ name: 'next' }],
+    paths: { '@/*': ['./src/*'] },
+  },
+  include: ['next-env.d.ts', '**/*.ts', '**/*.tsx', '.next/types/**/*.ts'],
+  exclude: ['node_modules'],
+};
+
+// Writes the four boilerplate files the orchestrator prompt used to dictate verbatim.
+// next.config.ts/postcss.config.mjs/tsconfig.json are pure boilerplate and always overwritten;
+// package.json is written only if missing, since `npm install` rewrites it and a re-run may
+// legitimately carry a dependency the agent added plus a lockfile that matches it.
+function scaffold(siteDir: string, onLog: (l: string) => void) {
+  const appDir = path.join(siteDir, 'app');
+
+  const packageJsonPath = path.join(appDir, 'package.json');
+  const packageJsonExisted = fs.existsSync(packageJsonPath);
+  if (!packageJsonExisted) {
+    fs.writeFileSync(packageJsonPath, JSON.stringify(SCAFFOLD_PACKAGE_JSON, null, 2) + '\n');
+  }
+
+  fs.writeFileSync(path.join(appDir, 'next.config.ts'), SCAFFOLD_NEXT_CONFIG);
+  fs.writeFileSync(path.join(appDir, 'postcss.config.mjs'), SCAFFOLD_POSTCSS_CONFIG);
+  fs.writeFileSync(path.join(appDir, 'tsconfig.json'), JSON.stringify(SCAFFOLD_TSCONFIG, null, 2) + '\n');
+
+  onLog(
+    `Rebuilding site — scaffolded app/ (${packageJsonExisted ? 'kept existing' : 'wrote'} package.json, next.config.ts, postcss.config.mjs, tsconfig.json)`,
+  );
+}
+
 async function rebuild(
   target: string,
   siteDir: string,
@@ -596,6 +668,7 @@ async function rebuild(
   abortController?: AbortController,
 ) {
   fs.mkdirSync(path.join(siteDir, 'app'), { recursive: true });
+  scaffold(siteDir, onLog);
   onLog(`Rebuilding site — ${pages.length} pages, design system first then parallel page builders`);
 
   let qaStarted = false;
