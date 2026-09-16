@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import sharp from 'sharp';
+import { hosted } from './serve.js';
 
 try {
   process.loadEnvFile('.env');
@@ -505,6 +506,9 @@ function orchestratorPrompt(
   mobile: { page: Page; file: string }[],
   tiles: { page: Page; tiles: string[] }[],
 ) {
+  const hostedClause = hosted()
+    ? ' `next.config.ts` also carries a `basePath` for hosted preview — do not remove or edit it.'
+    : '';
   const mobileFor = (p: Page) => mobile.find((m) => m.page.url === p.url)?.file;
   const tileCount = (p: Page) => tiles.find((t) => t.page.url === p.url)?.tiles.length ?? 0;
   // The naming rule is spelled out once, in the source/ inventory above; the page list carries
@@ -576,7 +580,7 @@ Do NOT eyeball the colors. Fetch the truth:
 \`app/package.json\`, \`app/next.config.ts\`, \`app/postcss.config.mjs\` and \`app/tsconfig.json\`
 already exist — do NOT recreate, edit or reformat them (do NOT run create-next-app either; it is
 interactive and slow). In particular, leave \`next.config.ts\`'s \`output: 'export'\` alone; the
-export-completeness check and the local preview server both depend on it. Your job in this phase:
+export-completeness check and the local preview server both depend on it.${hostedClause} Your job in this phase:
 - \`src/app/globals.css\`: \`@import "tailwindcss";\` then an \`@theme\` block defining the color and
   font tokens from \`source/design-tokens.md\` verbatim, plus the \`@keyframes\` you extracted.
 - Fonts via \`next/font/google\` in the root layout — closest match to the real font stack.
@@ -652,6 +656,15 @@ const SCAFFOLD_PACKAGE_JSON = {
 
 const SCAFFOLD_NEXT_CONFIG = `export default { output: 'export', images: { unoptimized: true } };\n`;
 
+// Hosted mode bakes the nginx mount point into every URL Next emits (chunks, CSS, next/font,
+// <Link> hrefs) so the export works when served from /preview/<domain>/ instead of the site
+// root. basePath must not end with '/' — serve.ts's rebaseExport strips the same trailing slash
+// before comparing against it.
+function nextConfigFor(domain: string): string {
+  if (!hosted()) return SCAFFOLD_NEXT_CONFIG;
+  return `export default { output: 'export', images: { unoptimized: true }, basePath: '/preview/${domain}' };\n`;
+}
+
 const SCAFFOLD_POSTCSS_CONFIG = `export default { plugins: { '@tailwindcss/postcss': {} } };\n`;
 
 const SCAFFOLD_TSCONFIG = {
@@ -682,6 +695,9 @@ const SCAFFOLD_TSCONFIG = {
 // legitimately carry a dependency the agent added plus a lockfile that matches it.
 function scaffold(siteDir: string, onLog: (l: string) => void) {
   const appDir = path.join(siteDir, 'app');
+  // The site directory's own basename, not a re-parse of the target URL — sites/<domain>/app is
+  // the one place the domain is already pinned (runClone derives siteDir from it the same way).
+  const domain = path.basename(siteDir);
 
   const packageJsonPath = path.join(appDir, 'package.json');
   const packageJsonExisted = fs.existsSync(packageJsonPath);
@@ -689,7 +705,7 @@ function scaffold(siteDir: string, onLog: (l: string) => void) {
     fs.writeFileSync(packageJsonPath, JSON.stringify(SCAFFOLD_PACKAGE_JSON, null, 2) + '\n');
   }
 
-  fs.writeFileSync(path.join(appDir, 'next.config.ts'), SCAFFOLD_NEXT_CONFIG);
+  fs.writeFileSync(path.join(appDir, 'next.config.ts'), nextConfigFor(domain));
   fs.writeFileSync(path.join(appDir, 'postcss.config.mjs'), SCAFFOLD_POSTCSS_CONFIG);
   fs.writeFileSync(path.join(appDir, 'tsconfig.json'), JSON.stringify(SCAFFOLD_TSCONFIG, null, 2) + '\n');
 

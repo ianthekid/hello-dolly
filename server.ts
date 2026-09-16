@@ -1,5 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { hosted } from './serve.js';
 
 const PORT = Number(process.env.PORT) || 3999;
 const STEPS = [
@@ -218,18 +219,20 @@ async function refreshPreviews() {
     a.target = '_blank';
     a.textContent = p.domain + ' — ' + (p.url || 'no port on record');
     li.appendChild(a);
-    const stopBtn = document.createElement('button');
-    stopBtn.textContent = 'Stop';
-    stopBtn.addEventListener('click', async () => {
-      stopBtn.disabled = true;
-      try {
-        await fetch('/api/previews/' + encodeURIComponent(p.domain) + '/stop', { method: 'POST' });
-      } catch (e) {
-        // ignore — refreshPreviews below shows whatever the current state actually is
-      }
-      refreshPreviews();
-    });
-    li.appendChild(stopBtn);
+    if (p.pgid) {
+      const stopBtn = document.createElement('button');
+      stopBtn.textContent = 'Stop';
+      stopBtn.addEventListener('click', async () => {
+        stopBtn.disabled = true;
+        try {
+          await fetch('/api/previews/' + encodeURIComponent(p.domain) + '/stop', { method: 'POST' });
+        } catch (e) {
+          // ignore — refreshPreviews below shows whatever the current state actually is
+        }
+        refreshPreviews();
+      });
+      li.appendChild(stopBtn);
+    }
     list.appendChild(li);
   });
   previewsEl.appendChild(list);
@@ -389,7 +392,7 @@ function renderSteps(activeIdx) {
 renderSteps(-1);
 
 function linkify(text) {
-  return text.replace(/(https?:\\/\\/[^\\s]+)/g, '<a href="$1" target="_blank">$1</a>');
+  return text.replace(/(https?:\\/\\/[^\\s]+|\\/preview\\/[^\\s]+)/g, '<a href="$1" target="_blank">$1</a>');
 }
 
 function renderForceRetry(url) {
@@ -546,6 +549,7 @@ const server = createServer(async (req, res) => {
       'Content-Type': 'text/event-stream',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     });
     for (const line of job.lines) {
       res.write(`event: log\ndata: ${JSON.stringify(line)}\n\n`);
@@ -753,6 +757,14 @@ const server = createServer(async (req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(PORT, () => {
-  console.log(`UI listening on http://localhost:${PORT}`);
-});
+if (hosted()) {
+  // 127.0.0.1 only — this box sits behind nginx, and the clone tool itself must never be
+  // reachable directly over the open port.
+  server.listen(PORT, '127.0.0.1', () => {
+    console.log(`UI listening on http://127.0.0.1:${PORT} (hosted mode)`);
+  });
+} else {
+  server.listen(PORT, () => {
+    console.log(`UI listening on http://localhost:${PORT}`);
+  });
+}
