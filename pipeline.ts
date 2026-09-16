@@ -44,7 +44,7 @@ async function firecrawl(endpoint: string, body: unknown): Promise<any> {
 async function saveImage(src: string, file: string) {
   const buf = src.startsWith('data:')
     ? Buffer.from(src.slice(src.indexOf(',') + 1), 'base64')
-    : Buffer.from(await fetch(src).then((r) => r.arrayBuffer()));
+    : Buffer.from((await fetch(src).then((r) => r.arrayBuffer())) as ArrayBuffer);
   fs.writeFileSync(file, buf);
   return buf.length;
 }

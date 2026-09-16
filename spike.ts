@@ -64,7 +64,7 @@ async function crawl(): Promise<Page[]> {
     fs.writeFileSync(path.join(sourceDir, `${name}.md`), d.markdown ?? '');
     let shot: string | null = null;
     if (d.screenshot) {
-      const buf = Buffer.from(await fetch(d.screenshot).then((r) => r.arrayBuffer()));
+      const buf = Buffer.from((await fetch(d.screenshot).then((r) => r.arrayBuffer())) as ArrayBuffer);
       fs.writeFileSync(path.join(sourceDir, `${name}.png`), buf);
       shot = `${name}.png`;
     }

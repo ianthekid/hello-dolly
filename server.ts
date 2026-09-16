@@ -1,7 +1,7 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 
-const PORT = 3999;
+const PORT = Number(process.env.PORT) || 3999;
 const STEPS = [
   'Mapping pages',
   'Extracting content',
