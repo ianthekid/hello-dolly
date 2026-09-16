@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Headless driver: runs PLAN_V1 Phases 1–2 unattended, one claude session per phase.
+# Headless driver: runs PLAN_V1 Phases 1–4 unattended, one claude session per phase.
 # Resume-safe (.done/ stamps). Stops the line if a phase fails both model tiers.
 set -u
 cd "$(dirname "$0")"
@@ -66,5 +66,15 @@ phase 1.5 sonnet   # token wins
 # line for the night. Sonnet-first keeps the opus escalation in reserve.
 phase 2.1 sonnet   # review gate before the rebuild (SSE review event + approve + replay)
 phase 2.2 sonnet   # stop button, force-unwedge, pre-QA cost checkpoint
+
+# PLAN_V1 Phase 3 — the big token win, then ops polish.
+phase 3.1 sonnet   # screenshot tiling at capture (adds sharp — the one permitted new dep)
+phase 3.2 sonnet   # scaffold the Next.js config files in code, not in the prompt
+phase 3.3 sonnet   # previews list + stop, duplicate "done" lines, live cost, Firecrawl retry
+
+# PLAN_V1 Phase 4 — hosted mode. Code only: HOSTED=1 skips the npx-serve spawn and links
+# nginx's /preview/<domain>/ instead. The nginx/ufw/systemd half is docs/HOSTED.md, which
+# Ian applies on the droplet by hand — no phase executes it.
+phase 4.1 sonnet   # hosted mode switch: basePath at generation, no per-preview server
 
 echo "=== ALL PHASES DONE — $(date)"
