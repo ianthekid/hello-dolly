@@ -3,7 +3,14 @@ import { createServer } from "node:net";
 import { readFileSync, writeFileSync, rmSync, existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 
+// Value stored here is a pgid, not a plain pid: publishPreview spawns the preview server
+// detached (its own process group), so child.pid IS the group's pgid. Always kill with
+// process.kill(-pgid, …) — killing the bare pid only reaps the "npx" wrapper and orphans
+// the "serve" process holding the port.
 const PID_NAME = "serve.pid";
+
+const BUILD_TIMEOUT_MS = 10 * 60 * 1000;
+const EXPORT_RETRY_DELAY_MS = 30_000;
 
 function isAlive(pid: number): boolean {
   try {
@@ -12,6 +19,10 @@ function isAlive(pid: number): boolean {
   } catch {
     return false;
   }
+}
+
+function killGroup(pgid: number, signal: NodeJS.Signals = "SIGTERM") {
+  process.kill(-pgid, signal);
 }
 
 function freePort(start: number): Promise<number> {
@@ -41,26 +52,73 @@ async function waitFor200(url: string, timeoutMs: number): Promise<void> {
   throw new Error(`preview did not respond with 200 within ${timeoutMs}ms: ${url}`);
 }
 
-export async function publishPreview(appDir: string, onLog: (line: string) => void): Promise<string> {
-  onLog("Building static export…");
-  const build = await new Promise<{ code: number | null; output: string }>((resolve) => {
+function runBuild(appDir: string): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
     const child = spawn("npx", ["next", "build"], { cwd: appDir });
     let output = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      reject(
+        new Error(`Publishing local preview failed: "next build" did not finish within ${BUILD_TIMEOUT_MS / 1000}s`),
+      );
+    }, BUILD_TIMEOUT_MS);
     child.stdout.on("data", (d) => (output += d));
     child.stderr.on("data", (d) => (output += d));
-    child.on("close", (code) => resolve({ code, output }));
+    child.once("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(`Publishing local preview failed: could not start "npx next build" — ${err.message}`));
+    });
+    child.once("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(new Error(`Publishing local preview failed: next build failed:\n${output.split("\n").slice(-40).join("\n")}`));
+      } else {
+        resolve();
+      }
+    });
   });
-  if (build.code !== 0) {
-    throw new Error(`next build failed:\n${build.output.split("\n").slice(-40).join("\n")}`);
+}
+
+export async function publishPreview(
+  appDir: string,
+  onLog: (line: string) => void,
+  verifyExport?: (appDir: string) => string[] | Promise<string[]>,
+): Promise<string> {
+  await runBuild(appDir);
+  onLog("Publishing local preview — static export built.");
+
+  if (verifyExport) {
+    let missing = await verifyExport(appDir);
+    if (missing.length) {
+      onLog(
+        `Publishing local preview — export missing ${missing.length} route(s) (${missing.join(", ")}), waiting 30s and re-checking…`,
+      );
+      await new Promise((r) => setTimeout(r, EXPORT_RETRY_DELAY_MS));
+      missing = await verifyExport(appDir);
+    }
+    if (missing.length) {
+      onLog(`Publishing local preview — still missing ${missing.join(", ")}, re-running export…`);
+      await runBuild(appDir);
+      missing = await verifyExport(appDir);
+    }
+    if (missing.length) {
+      throw new Error(`Publishing local preview failed: export is missing route(s): ${missing.join(", ")}`);
+    }
   }
-  onLog("Static export built.");
 
   const pidFile = path.join(appDir, PID_NAME);
   if (existsSync(pidFile)) {
-    const oldPid = Number(readFileSync(pidFile, "utf8").trim());
-    if (oldPid && isAlive(oldPid)) {
+    const oldPgid = Number(readFileSync(pidFile, "utf8").trim());
+    if (oldPgid && isAlive(oldPgid)) {
       try {
-        process.kill(oldPid);
+        killGroup(oldPgid);
       } catch {
         // already gone
       }
@@ -74,12 +132,30 @@ export async function publishPreview(appDir: string, onLog: (line: string) => vo
     detached: true,
     stdio: "ignore",
   });
+  let spawnSettled = false;
+  await new Promise<void>((resolve, reject) => {
+    child.on("error", (err) => {
+      if (spawnSettled) {
+        onLog(`Publishing local preview — preview server error after start: ${err.message}`);
+        return;
+      }
+      spawnSettled = true;
+      reject(new Error(`Publishing local preview failed: could not start "npx serve" — ${err.message}`));
+    });
+    child.once("spawn", () => {
+      spawnSettled = true;
+      resolve();
+    });
+  });
   child.unref();
+  if (!child.pid) {
+    throw new Error("Publishing local preview failed: spawned preview server has no pid.");
+  }
   writeFileSync(pidFile, String(child.pid));
 
   const url = `http://localhost:${port}`;
   await waitFor200(`${url}/`, 15000);
-  onLog(`Preview published at ${url}`);
+  onLog(`Publishing local preview — published at ${url}`);
   return url;
 }
 
@@ -90,14 +166,14 @@ if (process.argv[2] === "stop") {
     for (const site of readdirSync(sitesDir)) {
       const pidFile = path.join(sitesDir, site, "app", PID_NAME);
       if (!existsSync(pidFile)) continue;
-      const pid = Number(readFileSync(pidFile, "utf8").trim());
-      if (pid && isAlive(pid)) {
+      const pgid = Number(readFileSync(pidFile, "utf8").trim());
+      if (pgid && isAlive(pgid)) {
         try {
-          process.kill(pid);
-          console.log(`stopped preview for ${site} (pid ${pid})`);
+          killGroup(pgid);
+          console.log(`stopped preview for ${site} (pgid ${pgid})`);
           stopped++;
         } catch (e) {
-          console.log(`failed to kill pid ${pid} for ${site}: ${e}`);
+          console.log(`failed to kill pgid ${pgid} for ${site}: ${e}`);
         }
       }
       rmSync(pidFile, { force: true });

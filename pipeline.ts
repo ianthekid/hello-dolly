@@ -500,6 +500,27 @@ async function rebuild(
   if (!qaStarted) onLog('Verifying against original — QA pass did not report in; check the build manually');
 }
 
+// --------------------------------------------------- step 6: export completeness
+
+/**
+ * Mirrors the route -> file convention page-builders were told to use (orchestratorPrompt
+ * above): pathname "/a/b" -> src/app/a/b/page.tsx -> out/a/b.html or out/a/b/index.html
+ * (next export can produce either shape). The root page is out/index.html.
+ */
+function missingExportRoutes(appDir: string, pages: Page[]): string[] {
+  const missing: string[] = [];
+  for (const p of pages) {
+    const clean = new URL(p.url).pathname.replace(/^\/|\/$/g, '');
+    const candidates = clean
+      ? [path.join('out', `${clean}.html`), path.join('out', clean, 'index.html')]
+      : [path.join('out', 'index.html')];
+    if (!candidates.some((f) => fs.existsSync(path.join(appDir, f)))) {
+      missing.push(clean ? `/${clean}` : '/');
+    }
+  }
+  return missing;
+}
+
 // ---------------------------------------------------------------- public API
 
 export async function runClone(url: string, onLogOut: (line: string) => void): Promise<void> {
@@ -543,7 +564,7 @@ export async function runClone(url: string, onLogOut: (line: string) => void): P
     if (typeof serve.publishPreview !== 'function') {
       throw new Error('Publishing local preview failed: ./serve.ts does not export publishPreview().');
     }
-    const previewUrl = await serve.publishPreview(appDir, onLog);
+    const previewUrl = await serve.publishPreview(appDir, onLog, (dir) => missingExportRoutes(dir, pages));
     onLog(`Publishing local preview → ${previewUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
