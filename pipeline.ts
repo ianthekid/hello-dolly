@@ -3,6 +3,7 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 
 try {
   process.loadEnvFile('.env');
@@ -93,24 +94,46 @@ export function pickPages(target: string, links: string[]): string[] {
 
 // ------------------------------------------------------ step 2: crawl content
 
+type PagesCache = { key: string; crawledAt: string; pages: Page[] };
+
+const SCRAPE_OPTIONS = {
+  formats: ['markdown', { type: 'screenshot', fullPage: true }] as const,
+  onlyMainContent: false,
+};
+
+function crawlCacheKey(urls: string[]): string {
+  const canonical = JSON.stringify({
+    urls: [...urls].sort(),
+    maxPages: MAX_PAGES,
+    ...SCRAPE_OPTIONS,
+  });
+  return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 8);
+}
+
 async function crawlPages(
   urls: string[],
   sourceDir: string,
   onLog: (l: string) => void,
 ): Promise<Page[]> {
   const indexFile = path.join(sourceDir, 'pages.json');
-  if (fs.existsSync(indexFile)) {
-    const cached: Page[] = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
-    onLog(`Extracting content — reusing cached crawl (${cached.length} pages)`);
-    return cached;
+  const key = crawlCacheKey(urls);
+  const forceRecrawl = !!process.env.CLONE_FORCE_RECRAWL;
+
+  if (forceRecrawl) {
+    onLog('Extracting content — forced recrawl (CLONE_FORCE_RECRAWL set)');
+  } else if (fs.existsSync(indexFile)) {
+    const stored = JSON.parse(fs.readFileSync(indexFile, 'utf8'));
+    // A pre-existing bare-array pages.json (old format) is unkeyed by definition — treat as a miss.
+    const cache: PagesCache | null = Array.isArray(stored) ? null : stored;
+    if (cache?.key === key) {
+      onLog(`Extracting content — reusing cached crawl (${cache.pages.length} pages, key ${key})`);
+      return cache.pages;
+    }
+    onLog(`Extracting content — cache miss (page selection changed), recrawling ${urls.length} pages…`);
   }
 
   onLog(`Extracting content — scraping ${urls.length} selected pages…`);
-  const start = await firecrawl('/batch/scrape', {
-    urls,
-    formats: ['markdown', { type: 'screenshot', fullPage: true }],
-    onlyMainContent: false,
-  });
+  const start = await firecrawl('/batch/scrape', { urls, ...SCRAPE_OPTIONS });
 
   let job: any;
   for (;;) {
@@ -140,7 +163,8 @@ async function crawlPages(
     onLog(`Extracting content — saved ${name}`);
   }
   if (!pages.length) throw new Error('Firecrawl returned no pages for this site.');
-  fs.writeFileSync(indexFile, JSON.stringify(pages, null, 2));
+  const cache: PagesCache = { key, crawledAt: new Date().toISOString(), pages };
+  fs.writeFileSync(indexFile, JSON.stringify(cache, null, 2));
   return pages;
 }
 
