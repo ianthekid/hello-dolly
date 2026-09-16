@@ -96,18 +96,34 @@ export function pickPages(target: string, links: string[]): string[] {
 
 type PagesCache = { key: string; crawledAt: string; pages: Page[] };
 
-const SCRAPE_OPTIONS = {
+const BASE_SCRAPE_OPTIONS = {
   formats: ['markdown', { type: 'screenshot', fullPage: true }] as const,
-  onlyMainContent: false,
 };
 
 function crawlCacheKey(urls: string[]): string {
   const canonical = JSON.stringify({
     urls: [...urls].sort(),
     maxPages: MAX_PAGES,
-    ...SCRAPE_OPTIONS,
+    ...BASE_SCRAPE_OPTIONS,
+    // home gets onlyMainContent: false, every other page true — see crawlPages.
+    onlyMainContent: 'split-by-home',
   });
   return crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 8);
+}
+
+/** Kick off a Firecrawl batch/scrape job and poll it to completion. */
+async function pollBatchJob(jobUrl: string, label: string, onLog: (l: string) => void): Promise<any[]> {
+  let job: any;
+  for (;;) {
+    await new Promise((r) => setTimeout(r, 5000));
+    job = await fetch(jobUrl, { headers: headers() }).then((r) => r.json());
+    onLog(`Extracting content — ${label} ${job.completed ?? 0}/${job.total ?? '?'} pages`);
+    if (job.status !== 'scraping') break;
+  }
+  if (job.status !== 'completed') {
+    throw new Error(`Firecrawl crawl did not complete (status: ${job.status}).`);
+  }
+  return job.data as any[];
 }
 
 async function crawlPages(
@@ -133,22 +149,25 @@ async function crawlPages(
   }
 
   onLog(`Extracting content — scraping ${urls.length} selected pages…`);
-  const start = await firecrawl('/batch/scrape', { urls, ...SCRAPE_OPTIONS });
 
-  let job: any;
-  for (;;) {
-    await new Promise((r) => setTimeout(r, 5000));
-    job = await fetch(start.url, { headers: headers() }).then((r) => r.json());
-    onLog(`Extracting content — ${job.completed ?? 0}/${job.total ?? '?'} pages`);
-    if (job.status !== 'scraping') break;
+  // The home page needs full chrome (nav + footer are extracted from it); inner pages don't.
+  // Firecrawl's batch endpoint applies one options object to the whole batch, so split in two.
+  const homeUrls = urls.filter((u) => slug(u) === 'home');
+  const innerUrls = urls.filter((u) => slug(u) !== 'home');
+  const jobs: Promise<any[]>[] = [];
+  if (homeUrls.length) {
+    const start = await firecrawl('/batch/scrape', { urls: homeUrls, ...BASE_SCRAPE_OPTIONS, onlyMainContent: false });
+    jobs.push(pollBatchJob(start.url, 'home', onLog));
   }
-  if (job.status !== 'completed') {
-    throw new Error(`Firecrawl crawl did not complete (status: ${job.status}).`);
+  if (innerUrls.length) {
+    const start = await firecrawl('/batch/scrape', { urls: innerUrls, ...BASE_SCRAPE_OPTIONS, onlyMainContent: true });
+    jobs.push(pollBatchJob(start.url, 'inner', onLog));
   }
+  const data = (await Promise.all(jobs)).flat();
 
   fs.mkdirSync(sourceDir, { recursive: true });
   const pages: Page[] = [];
-  for (const d of job.data as any[]) {
+  for (const d of data) {
     const url = d.metadata?.sourceURL ?? d.metadata?.url;
     if (!url) continue;
     let name = slug(url);
@@ -260,8 +279,9 @@ const QA_MARKER = 'QA_PASS_START';
 
 const pageBuilderPrompt = `You build ONE page of a website clone as part of a larger rebuild.
 
-You are given: the page's route, its source markdown file, its full-page desktop screenshot
-(and sometimes a mobile screenshot), and the shared design-tokens note.
+You are given: the page's route, its source markdown file, and its full-page desktop screenshot
+(and sometimes a mobile screenshot). Before you write anything, read \`source/design-tokens.md\`
+with the Read tool — it is the shared design-tokens note for the whole site.
 
 Rules:
 - The screenshot is the spec; the markdown is the content. Read the PNG with the Read tool and
@@ -283,23 +303,18 @@ Rules:
 Report back: the file you created, the images you downloaded, and anything from the screenshot
 you could not reproduce. Keep it to a few lines.`;
 
-const qaPrompt = `You are the visual QA reviewer for a website clone. Be exacting; you are the last gate.
+const qaPrompt = `You are the QA reviewer for a website clone. Be exacting; you are the last gate.
 
 Run this checklist and FIX what you find (you may edit any file):
 1. \`cd app && npx next build\` — it MUST exit 0. Fix every error and type error. Re-run until clean.
 2. \`app/out/\` must contain an .html file for every page in source/pages.json. A missing one means
    that route was never built — build it.
-3. For each page: Read its source/<name>.png next to the page code. Is every section from the
-   screenshot present, in order? Are colors, fonts, spacing and image placement a match? Is the
-   text verbatim from the markdown? Fix what is missing or wrong.
-4. Mobile: check the pages that have a source/<name>.mobile.png against the built mobile layout.
-   Nothing may overflow horizontally at 390px; the hamburger menu must open and close.
-5. NO HOT-LINKING. Grep the whole app/ tree (including app/out/) for the original domain in any
+3. NO HOT-LINKING. Grep the whole app/ tree (including app/out/) for the original domain in any
    src=, srcset=, href= on <link rel=preload>, or CSS url(). Every hit is a bug: download the asset
    into app/public/ and point at the local path. Report zero remaining hits.
-6. Grep for placeholder junk — "lorem", "TODO", "placeholder", "example.com", href="#" in nav —
+4. Grep for placeholder junk — "lorem", "TODO", "placeholder", "example.com", href="#" in nav —
    and replace with real values from the markdown.
-7. Header and Footer appear exactly once on every page.
+5. Header and Footer appear exactly once on every page.
 
 If you need to serve app/out/ for any check, use port 4998 ONLY (never 3999 — that is the clone
 tool's own UI) and kill your server before you finish reporting.
@@ -388,7 +403,9 @@ Each delegation prompt must contain, inline:
 - the route to create (preserve the original pathname: \`/services/service\` ->
   \`src/app/services/service/page.tsx\`), and the page title for \`metadata\`;
 - the source file names: \`source/<name>.md\`, \`source/<name>.png\`, and the \`.mobile.png\` if listed above;
-- the FULL contents of \`source/design-tokens.md\` (paste it — subagents do not share your context);
+- the path \`source/design-tokens.md\` and an instruction to read it with the Read tool before
+  writing anything (subagents do not share your context, so they must read it themselves — do not
+  paste its contents);
 - the exact import paths and prop signatures of the shared components, and the note that
   layout.tsx already renders Header and Footer so the page must NOT render them again;
 - a pointer to \`src/app/page.tsx\` as the reference for style and structure.
@@ -450,7 +467,11 @@ async function rebuild(
         model: 'opus',
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
-        maxTurns: 800,
+        maxTurns: 200,
+        // Bounded, not off: the orchestrator's work is mostly mechanical (extract tokens,
+        // scaffold, delegate, grep) rather than open-ended reasoning, so it doesn't need a large
+        // thinking budget, but 0 would disable thinking outright on models that honor this field.
+        maxThinkingTokens: 4096,
         agents: {
           'page-builder': {
             description: 'Builds one page of the clone from its markdown + screenshot + design tokens.',
@@ -458,8 +479,8 @@ async function rebuild(
             prompt: pageBuilderPrompt,
           },
           qa: {
-            description: 'Visual QA: verifies the rebuilt site against the original screenshots and the build.',
-            model: 'opus',
+            description: 'QA: verifies the build, export completeness, and hot-linking/placeholder checks.',
+            model: 'sonnet',
             prompt: qaPrompt,
           },
         },
