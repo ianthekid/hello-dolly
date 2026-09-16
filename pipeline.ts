@@ -463,6 +463,7 @@ async function rebuild(
   pages: Page[],
   mobile: { page: Page; file: string }[],
   onLog: (l: string) => void,
+  abortController?: AbortController,
 ) {
   fs.mkdirSync(path.join(siteDir, 'app'), { recursive: true });
   onLog(`Rebuilding site — ${pages.length} pages, design system first then parallel page builders`);
@@ -498,6 +499,7 @@ async function rebuild(
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         maxTurns: 200,
+        abortController,
         // Bounded, not off: the orchestrator's work is mostly mechanical (extract tokens,
         // scaffold, delegate, grep) rather than open-ended reasoning, so it doesn't need a large
         // thinking budget, but 0 would disable thinking outright on models that honor this field.
@@ -579,6 +581,13 @@ export type PageProposal = {
   filtered: FilteredLink[];
 };
 
+export type CostEstimate = { pages: number; estimatedCost: number };
+
+// Rough per-page heuristic, not measured from real runs — refine once Phase 2.2's
+// checkpoint has seen actual rebuild costs across a range of page counts.
+const BASE_REBUILD_COST = 0.5;
+const EST_COST_PER_PAGE = 0.15;
+
 export type RunCloneOptions = {
   /**
    * Called after capture, before the expensive rebuild. Resolves to the
@@ -586,7 +595,19 @@ export type RunCloneOptions = {
    * unattended behaviour (used by CLONE_DRY_RUN and script callers).
    */
   onReview?: (proposal: PageProposal) => Promise<string[] | null>;
+  /**
+   * Called after the page review (if any), before the rebuild agent session
+   * starts. Resolves true to proceed, false to cancel. Omit to keep today's
+   * unattended behaviour.
+   */
+  onConfirm?: (estimate: CostEstimate) => Promise<boolean>;
+  /** Aborts the rebuild session and any in-flight capture/publish work. */
+  abortController?: AbortController;
 };
+
+function assertNotAborted(signal: AbortSignal | undefined) {
+  if (signal?.aborted) throw new Error('Stopped by user');
+}
 
 export async function runClone(
   url: string,
@@ -605,6 +626,8 @@ export async function runClone(
   const sourceDir = path.join(siteDir, 'source');
   fs.mkdirSync(sourceDir, { recursive: true });
 
+  const signal = options?.abortController?.signal;
+
   // Append-mode: re-running the same domain adds to run.log rather than truncating it, so a
   // history of past attempts survives.
   const logStream = fs.createWriteStream(path.join(siteDir, 'run.log'), { flags: 'a' });
@@ -615,9 +638,12 @@ export async function runClone(
 
   try {
     const links = await mapPages(target, onLog);
+    assertNotAborted(signal);
     const { picked, filtered } = pickPagesDetailed(target, links);
     const pages = await crawlPages(picked, sourceDir, onLog);
+    assertNotAborted(signal);
     const mobile = await captureMobile(pages, sourceDir, onLog);
+    assertNotAborted(signal);
 
     if (process.env.CLONE_DRY_RUN) {
       onLog('Dry run (CLONE_DRY_RUN=1) — stopping after capture.');
@@ -640,7 +666,20 @@ export async function runClone(
       buildPages = pages.filter((p) => approvedSet.has(p.url));
     }
 
-    await rebuild(target, siteDir, buildPages, mobile, onLog);
+    if (options?.onConfirm) {
+      const estimate: CostEstimate = {
+        pages: buildPages.length,
+        estimatedCost: Math.round((BASE_REBUILD_COST + buildPages.length * EST_COST_PER_PAGE) * 100) / 100,
+      };
+      onLog(`Rebuilding site — estimated cost ~$${estimate.estimatedCost.toFixed(2)} for ${estimate.pages} pages — awaiting approval…`);
+      const proceed = await options.onConfirm(estimate);
+      if (!proceed) {
+        onLog('Cancelled — rebuild not approved.');
+        return;
+      }
+    }
+
+    await rebuild(target, siteDir, buildPages, mobile, onLog, options?.abortController);
 
     const appDir = path.join(siteDir, 'app');
     onLog('Publishing local preview — building static export…');
@@ -650,7 +689,7 @@ export async function runClone(
     if (typeof serve.publishPreview !== 'function') {
       throw new Error('Publishing local preview failed: ./serve.ts does not export publishPreview().');
     }
-    const previewUrl = await serve.publishPreview(appDir, onLog, (dir) => missingExportRoutes(dir, buildPages));
+    const previewUrl = await serve.publishPreview(appDir, onLog, (dir) => missingExportRoutes(dir, buildPages), signal);
     onLog(`Publishing local preview → ${previewUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

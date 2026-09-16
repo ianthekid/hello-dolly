@@ -52,9 +52,9 @@ async function waitFor200(url: string, timeoutMs: number): Promise<void> {
   throw new Error(`preview did not respond with 200 within ${timeoutMs}ms: ${url}`);
 }
 
-function runBuild(appDir: string): Promise<void> {
+function runBuild(appDir: string, signal?: AbortSignal): Promise<void> {
   return new Promise<void>((resolve, reject) => {
-    const child = spawn("npx", ["next", "build"], { cwd: appDir });
+    const child = spawn("npx", ["next", "build"], { cwd: appDir, signal });
     let output = "";
     let settled = false;
     const timer = setTimeout(() => {
@@ -71,7 +71,11 @@ function runBuild(appDir: string): Promise<void> {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      reject(new Error(`Publishing local preview failed: could not start "npx next build" — ${err.message}`));
+      if (err.name === "AbortError") {
+        reject(new Error("Publishing local preview stopped by user during \"next build\"."));
+      } else {
+        reject(new Error(`Publishing local preview failed: could not start "npx next build" — ${err.message}`));
+      }
     });
     child.once("close", (code) => {
       if (settled) return;
@@ -90,8 +94,11 @@ export async function publishPreview(
   appDir: string,
   onLog: (line: string) => void,
   verifyExport?: (appDir: string) => string[] | Promise<string[]>,
+  signal?: AbortSignal,
 ): Promise<string> {
-  await runBuild(appDir);
+  if (signal?.aborted) throw new Error("Publishing local preview stopped by user before it started.");
+
+  await runBuild(appDir, signal);
   onLog("Publishing local preview — static export built.");
 
   if (verifyExport) {
@@ -105,13 +112,15 @@ export async function publishPreview(
     }
     if (missing.length) {
       onLog(`Publishing local preview — still missing ${missing.join(", ")}, re-running export…`);
-      await runBuild(appDir);
+      await runBuild(appDir, signal);
       missing = await verifyExport(appDir);
     }
     if (missing.length) {
       throw new Error(`Publishing local preview failed: export is missing route(s): ${missing.join(", ")}`);
     }
   }
+
+  if (signal?.aborted) throw new Error("Publishing local preview stopped by user before the preview server started.");
 
   const pidFile = path.join(appDir, PID_NAME);
   if (existsSync(pidFile)) {
@@ -131,7 +140,23 @@ export async function publishPreview(
     cwd: appDir,
     detached: true,
     stdio: "ignore",
+    signal,
   });
+  // The signal option only kills the immediate "npx" pid; the detached group's "serve"
+  // process needs the same negative-pid teardown as the pid-file path above.
+  if (signal) {
+    const killOnAbort = () => {
+      if (child.pid) {
+        try {
+          killGroup(child.pid);
+        } catch {
+          // already gone
+        }
+      }
+    };
+    if (signal.aborted) killOnAbort();
+    else signal.addEventListener("abort", killOnAbort, { once: true });
+  }
   let spawnSettled = false;
   await new Promise<void>((resolve, reject) => {
     child.on("error", (err) => {
@@ -140,7 +165,11 @@ export async function publishPreview(
         return;
       }
       spawnSettled = true;
-      reject(new Error(`Publishing local preview failed: could not start "npx serve" — ${err.message}`));
+      if (err.name === "AbortError") {
+        reject(new Error("Publishing local preview stopped by user before the preview server started."));
+      } else {
+        reject(new Error(`Publishing local preview failed: could not start "npx serve" — ${err.message}`));
+      }
     });
     child.once("spawn", () => {
       spawnSettled = true;
