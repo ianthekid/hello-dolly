@@ -59,15 +59,20 @@ async function mapPages(target: string, onLog: (l: string) => void): Promise<str
   return links;
 }
 
+export type FilteredLink = { url: string; reason: string };
+export type PagePick = { picked: string[]; filtered: FilteredLink[] };
+
 /**
  * Pick the MAX_PAGES most representative URLs from the site map: shallow nav
  * pages (About, Services, Contact…) before deep ones, dated posts last — so a
- * capped clone gets the site's structure, not 13 news articles.
+ * capped clone gets the site's structure, not 13 news articles. Also reports
+ * what got dropped and why, for the pre-rebuild review gate.
  */
-export function pickPages(target: string, links: string[]): string[] {
+export function pickPagesDetailed(target: string, links: string[]): PagePick {
   const host = new URL(target).hostname.replace(/^www\./, '');
   const seen = new Set<string>();
-  const candidates: { url: string; score: number }[] = [];
+  const candidates: { url: string; score: number; dated: boolean }[] = [];
+  const filtered: FilteredLink[] = [];
   for (const link of links) {
     let u: URL;
     try {
@@ -75,21 +80,46 @@ export function pickPages(target: string, links: string[]): string[] {
     } catch {
       continue;
     }
-    if (u.hostname.replace(/^www\./, '') !== host) continue;
+    if (u.hostname.replace(/^www\./, '') !== host) {
+      filtered.push({ url: link, reason: 'off-host' });
+      continue;
+    }
     const p = u.pathname.replace(/\/$/, '');
-    if (/\.(pdf|jpe?g|png|gif|svg|webp|zip|mp4|xml|txt)$/i.test(p) || /\/(feed|wp-json)\b/.test(p)) continue;
+    if (/\.(pdf|jpe?g|png|gif|svg|webp|zip|mp4|xml|txt)$/i.test(p)) {
+      filtered.push({ url: link, reason: 'asset file, not a page' });
+      continue;
+    }
+    if (/\/(feed|wp-json)\b/.test(p)) {
+      filtered.push({ url: link, reason: 'feed/wp-json endpoint' });
+      continue;
+    }
     const key = `${host}${p}`;
-    if (seen.has(key)) continue;
+    if (seen.has(key)) {
+      filtered.push({ url: link, reason: 'duplicate URL' });
+      continue;
+    }
     seen.add(key);
     const depth = p.split('/').filter(Boolean).length;
+    const dated = /\/20\d\d(\/|$)/.test(p);
     // ponytail: naive heuristic — depth + dated-post penalty; refine if a site's nav still gets crowded out
-    const score = depth + (/\/20\d\d(\/|$)/.test(p) ? 100 : 0);
-    candidates.push({ url: `${u.origin}${p || '/'}`, score });
+    const score = depth + (dated ? 100 : 0);
+    candidates.push({ url: `${u.origin}${p || '/'}`, score, dated });
   }
   candidates.sort((a, b) => a.score - b.score);
   const picked = candidates.slice(0, MAX_PAGES).map((c) => c.url);
+  for (const c of candidates.slice(MAX_PAGES)) {
+    filtered.push({
+      url: c.url,
+      reason: c.dated ? 'dated post, deprioritized past the MAX_PAGES cap' : 'over the MAX_PAGES cap',
+    });
+  }
   if (!picked.length) picked.push(target);
-  return picked;
+  return { picked, filtered };
+}
+
+/** Back-compat wrapper: just the picked URLs, no filter reasons. */
+export function pickPages(target: string, links: string[]): string[] {
+  return pickPagesDetailed(target, links).picked;
 }
 
 // ------------------------------------------------------ step 2: crawl content
@@ -544,7 +574,25 @@ function missingExportRoutes(appDir: string, pages: Page[]): string[] {
 
 // ---------------------------------------------------------------- public API
 
-export async function runClone(url: string, onLogOut: (line: string) => void): Promise<void> {
+export type PageProposal = {
+  pages: { url: string; title: string; hasScreenshot: boolean }[];
+  filtered: FilteredLink[];
+};
+
+export type RunCloneOptions = {
+  /**
+   * Called after capture, before the expensive rebuild. Resolves to the
+   * approved URL subset, or null/empty to cancel. Omit to keep today's
+   * unattended behaviour (used by CLONE_DRY_RUN and script callers).
+   */
+  onReview?: (proposal: PageProposal) => Promise<string[] | null>;
+};
+
+export async function runClone(
+  url: string,
+  onLogOut: (line: string) => void,
+  options?: RunCloneOptions,
+): Promise<void> {
   let target: string;
   try {
     target = new URL(url).toString();
@@ -567,7 +615,8 @@ export async function runClone(url: string, onLogOut: (line: string) => void): P
 
   try {
     const links = await mapPages(target, onLog);
-    const pages = await crawlPages(pickPages(target, links), sourceDir, onLog);
+    const { picked, filtered } = pickPagesDetailed(target, links);
+    const pages = await crawlPages(picked, sourceDir, onLog);
     const mobile = await captureMobile(pages, sourceDir, onLog);
 
     if (process.env.CLONE_DRY_RUN) {
@@ -575,7 +624,23 @@ export async function runClone(url: string, onLogOut: (line: string) => void): P
       return;
     }
 
-    await rebuild(target, siteDir, pages, mobile, onLog);
+    let buildPages = pages;
+    if (options?.onReview) {
+      onLog('Capturing design — awaiting review…');
+      const proposal: PageProposal = {
+        pages: pages.map((p) => ({ url: p.url, title: p.title, hasScreenshot: !!p.screenshot })),
+        filtered,
+      };
+      const approved = await options.onReview(proposal);
+      if (!approved || !approved.length) {
+        onLog('Cancelled — no pages approved.');
+        return;
+      }
+      const approvedSet = new Set(approved);
+      buildPages = pages.filter((p) => approvedSet.has(p.url));
+    }
+
+    await rebuild(target, siteDir, buildPages, mobile, onLog);
 
     const appDir = path.join(siteDir, 'app');
     onLog('Publishing local preview — building static export…');
@@ -585,7 +650,7 @@ export async function runClone(url: string, onLogOut: (line: string) => void): P
     if (typeof serve.publishPreview !== 'function') {
       throw new Error('Publishing local preview failed: ./serve.ts does not export publishPreview().');
     }
-    const previewUrl = await serve.publishPreview(appDir, onLog, (dir) => missingExportRoutes(dir, pages));
+    const previewUrl = await serve.publishPreview(appDir, onLog, (dir) => missingExportRoutes(dir, buildPages));
     onLog(`Publishing local preview → ${previewUrl}`);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

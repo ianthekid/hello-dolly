@@ -17,6 +17,8 @@ type Job = {
   done: boolean;
   error: string | null;
   subscribers: ServerResponse[];
+  pendingReview: string | null; // JSON-encoded proposal, kept for SSE replay on reconnect
+  resolveReview: ((urls: string[] | null) => void) | null;
 };
 
 let job: Job | null = null;
@@ -25,6 +27,11 @@ function broadcast(event: string, data: string) {
   if (!job) return;
   const payload = `event: ${event}\ndata: ${data}\n\n`;
   for (const res of job.subscribers) res.write(payload);
+}
+
+function jobLog(j: Job, line: string) {
+  j.lines.push(line);
+  broadcast('log', JSON.stringify(line));
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -37,20 +44,32 @@ function readBody(req: IncomingMessage): Promise<string> {
 }
 
 function startJob(url: string) {
-  const j: Job = { id: randomUUID(), lines: [], done: false, error: null, subscribers: [] };
+  const j: Job = {
+    id: randomUUID(),
+    lines: [],
+    done: false,
+    error: null,
+    subscribers: [],
+    pendingReview: null,
+    resolveReview: null,
+  };
   job = j;
 
-  const onLog = (line: string) => {
-    j.lines.push(line);
-    broadcast('log', JSON.stringify(line));
-  };
+  const onLog = (line: string) => jobLog(j, line);
+
+  const onReview = (proposal: unknown): Promise<string[] | null> =>
+    new Promise((resolve) => {
+      j.pendingReview = JSON.stringify(proposal);
+      j.resolveReview = resolve;
+      broadcast('review', j.pendingReview);
+    });
 
   (async () => {
     try {
       const pipeline = await import('./pipeline').catch(() => {
         throw new Error('Pipeline module not found — Phase 1 has not built pipeline.ts yet.');
       });
-      await pipeline.runClone(url, onLog);
+      await pipeline.runClone(url, onLog, { onReview });
       j.done = true;
       broadcast('done', JSON.stringify(''));
     } catch (err) {
@@ -94,6 +113,13 @@ const PAGE = `<!doctype html>
   ul#steps li.pending::before { content: "○ "; }
   #log { background: #f6f8fa; border: 1px solid #ddd; border-radius: 4px; padding: 0.75rem; height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; }
   #error { color: #cb2431; margin-top: 0.5rem; }
+  #review { display: none; border: 1px solid #ddd; border-radius: 4px; padding: 0.75rem; margin: 0.75rem 0; }
+  #review h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+  #review ul { list-style: none; padding: 0; margin: 0 0 0.5rem; max-height: 220px; overflow-y: auto; }
+  #review li { padding: 0.15rem 0; }
+  #review .filtered { color: #999; font-size: 0.85rem; }
+  #review .actions { margin-top: 0.5rem; }
+  #review .actions button { margin-right: 0.5rem; }
 </style>
 </head>
 <body>
@@ -101,6 +127,7 @@ const PAGE = `<!doctype html>
 <input id="url" placeholder="https://example.com" />
 <button id="go">Clone</button>
 <ul id="steps"></ul>
+<div id="review"></div>
 <div id="log"></div>
 <div id="error"></div>
 <script>
@@ -110,6 +137,92 @@ const logEl = document.getElementById('log');
 const errEl = document.getElementById('error');
 const urlEl = document.getElementById('url');
 const goEl = document.getElementById('go');
+const reviewEl = document.getElementById('review');
+
+function hideReview() {
+  reviewEl.style.display = 'none';
+  reviewEl.innerHTML = '';
+}
+
+function renderReview(jobId, proposal) {
+  reviewEl.innerHTML = '';
+  reviewEl.style.display = 'block';
+
+  const h2 = document.createElement('h2');
+  h2.textContent = 'Review pages before rebuild (' + proposal.pages.length + ' selected)';
+  reviewEl.appendChild(h2);
+
+  const list = document.createElement('ul');
+  const checkboxes = [];
+  proposal.pages.forEach((p) => {
+    const li = document.createElement('li');
+    const label = document.createElement('label');
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = true;
+    cb.value = p.url;
+    checkboxes.push(cb);
+    label.appendChild(cb);
+    label.appendChild(document.createTextNode(' ' + p.title + ' — ' + p.url + (p.hasScreenshot ? '' : ' (no screenshot)')));
+    li.appendChild(label);
+    list.appendChild(li);
+  });
+  reviewEl.appendChild(list);
+
+  if (proposal.filtered && proposal.filtered.length) {
+    const fh = document.createElement('div');
+    fh.className = 'filtered';
+    fh.textContent = 'Filtered out (' + proposal.filtered.length + '):';
+    reviewEl.appendChild(fh);
+    const flist = document.createElement('ul');
+    proposal.filtered.forEach((f) => {
+      const li = document.createElement('li');
+      li.className = 'filtered';
+      li.textContent = f.url + ' — ' + f.reason;
+      flist.appendChild(li);
+    });
+    reviewEl.appendChild(flist);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  const approveBtn = document.createElement('button');
+  approveBtn.textContent = 'Approve';
+  approveBtn.addEventListener('click', async () => {
+    approveBtn.disabled = true;
+    cancelBtn.disabled = true;
+    const urls = checkboxes.filter((cb) => cb.checked).map((cb) => cb.value);
+    try {
+      await fetch('/api/clone/' + jobId + '/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ urls }),
+      });
+    } catch (e) {
+      errEl.textContent = 'Approve failed: ' + e;
+    }
+    hideReview();
+  });
+  const cancelBtn = document.createElement('button');
+  cancelBtn.textContent = 'Cancel';
+  cancelBtn.addEventListener('click', async () => {
+    approveBtn.disabled = true;
+    cancelBtn.disabled = true;
+    try {
+      await fetch('/api/clone/' + jobId + '/approve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cancel: true }),
+      });
+    } catch (e) {
+      errEl.textContent = 'Cancel failed: ' + e;
+    }
+    hideReview();
+  });
+  actions.appendChild(approveBtn);
+  actions.appendChild(cancelBtn);
+  reviewEl.appendChild(actions);
+}
 
 function renderSteps(activeIdx) {
   stepsEl.innerHTML = '';
@@ -129,6 +242,7 @@ function linkify(text) {
 goEl.addEventListener('click', async () => {
   errEl.textContent = '';
   logEl.textContent = '';
+  hideReview();
   renderSteps(-1);
   goEl.disabled = true;
   let res;
@@ -168,7 +282,11 @@ goEl.addEventListener('click', async () => {
       renderSteps(activeIdx);
     }
   });
+  es.addEventListener('review', (e) => {
+    renderReview(id, JSON.parse(e.data));
+  });
   es.addEventListener('done', () => {
+    hideReview();
     renderSteps(STEPS.length);
     goEl.disabled = false;
     es.close();
@@ -176,6 +294,7 @@ goEl.addEventListener('click', async () => {
   es.addEventListener('error', (e) => {
     // Named "event: error" messages carry .data; transport-level errors don't.
     if (e.data) errEl.textContent = JSON.parse(e.data);
+    hideReview();
     goEl.disabled = false;
     es.close();
   });
@@ -235,6 +354,9 @@ const server = createServer(async (req, res) => {
     for (const line of job.lines) {
       res.write(`event: log\ndata: ${JSON.stringify(line)}\n\n`);
     }
+    if (job.pendingReview) {
+      res.write(`event: review\ndata: ${job.pendingReview}\n\n`);
+    }
     if (job.done) {
       if (job.error) {
         res.write(`event: error\ndata: ${JSON.stringify(job.error)}\n\n`);
@@ -248,6 +370,69 @@ const server = createServer(async (req, res) => {
     req.on('close', () => {
       if (job) job.subscribers = job.subscribers.filter((r) => r !== res);
     });
+    return;
+  }
+
+  const approveMatch = url.pathname.match(/^\/api\/clone\/([^/]+)\/approve$/);
+  if (req.method === 'POST' && approveMatch) {
+    const id = approveMatch[1];
+    if (!job || job.id !== id) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unknown job id' }));
+      return;
+    }
+    if (!job.pendingReview || !job.resolveReview) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'No pending review for this job' }));
+      return;
+    }
+    const body = await readBody(req);
+    let parsed: any;
+    try {
+      parsed = JSON.parse(body);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid JSON body' }));
+      return;
+    }
+
+    const resolve = job.resolveReview;
+    const proposal = JSON.parse(job.pendingReview) as { pages: { url: string }[] };
+
+    if (parsed?.cancel === true) {
+      job.pendingReview = null;
+      job.resolveReview = null;
+      jobLog(job, 'Cancelled — operator declined the review.');
+      resolve(null);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    const urls = parsed?.urls;
+    if (!Array.isArray(urls) || !urls.every((u) => typeof u === 'string')) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'urls must be an array of strings' }));
+      return;
+    }
+    const allowed = new Set(proposal.pages.map((p) => p.url));
+    if (!urls.every((u) => allowed.has(u))) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'urls must be a subset of the proposed pages' }));
+      return;
+    }
+
+    job.pendingReview = null;
+    job.resolveReview = null;
+    if (urls.length) {
+      jobLog(job, `Capturing design — approved ${urls.length} of ${proposal.pages.length} pages`);
+      resolve(urls);
+    } else {
+      jobLog(job, 'Cancelled — no pages selected.');
+      resolve(null);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
 
