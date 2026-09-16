@@ -404,51 +404,73 @@ async function rebuild(
     onLog(line);
   };
 
-  for await (const m of query({
-    prompt: orchestratorPrompt(target, pages, mobile),
-    options: {
-      cwd: siteDir,
-      model: 'opus',
-      permissionMode: 'bypassPermissions',
-      allowDangerouslySkipPermissions: true,
-      maxTurns: 800,
-      agents: {
-        'page-builder': {
-          description: 'Builds one page of the clone from its markdown + screenshot + design tokens.',
-          model: 'sonnet',
-          prompt: pageBuilderPrompt,
-        },
-        qa: {
-          description: 'Visual QA: verifies the rebuilt site against the original screenshots and the build.',
-          model: 'opus',
-          prompt: qaPrompt,
+  // Live cost: the SDK only guarantees total_cost_usd on 'result' messages, so track the
+  // latest one we've seen and surface it at most every ~30s or on a several-cent jump —
+  // whichever comes first — rather than only in the one summary line at the end.
+  let latestCost = 0;
+  let lastEmittedCost = 0;
+  const emitCost = () => {
+    if (latestCost <= 0) return;
+    lastEmittedCost = latestCost;
+    onLog(`Rebuilding site — $${latestCost.toFixed(2)} so far`);
+  };
+  const costTimer = setInterval(() => {
+    if (latestCost !== lastEmittedCost) emitCost();
+  }, 30_000);
+
+  try {
+    for await (const m of query({
+      prompt: orchestratorPrompt(target, pages, mobile),
+      options: {
+        cwd: siteDir,
+        model: 'opus',
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        maxTurns: 800,
+        agents: {
+          'page-builder': {
+            description: 'Builds one page of the clone from its markdown + screenshot + design tokens.',
+            model: 'sonnet',
+            prompt: pageBuilderPrompt,
+          },
+          qa: {
+            description: 'Visual QA: verifies the rebuilt site against the original screenshots and the build.',
+            model: 'opus',
+            prompt: qaPrompt,
+          },
         },
       },
-    },
-  })) {
-    if (m.type === 'assistant') {
-      for (const b of m.message.content as any[]) {
-        if (b.type !== 'tool_use') continue;
-        const isQa =
-          (b.name === 'Bash' && String(b.input?.command ?? '').includes(QA_MARKER)) ||
-          (b.name === 'Task' && b.input?.subagent_type === 'qa');
-        if (isQa && !qaStarted) {
-          qaStarted = true;
-          onLog('Verifying against original — visual QA pass on every page…');
-          continue;
+    })) {
+      if (m.type === 'assistant') {
+        for (const b of m.message.content as any[]) {
+          if (b.type !== 'tool_use') continue;
+          const isQa =
+            (b.name === 'Bash' && String(b.input?.command ?? '').includes(QA_MARKER)) ||
+            (b.name === 'Task' && b.input?.subagent_type === 'qa');
+          if (isQa && !qaStarted) {
+            qaStarted = true;
+            onLog('Verifying against original — visual QA pass on every page…');
+            continue;
+          }
+          const line = describeTool(b.name, b.input);
+          if (line) log(line);
         }
-        const line = describeTool(b.name, b.input);
-        if (line) log(line);
+      } else if (m.type === 'result') {
+        if (typeof m.total_cost_usd === 'number' && m.total_cost_usd > 0) {
+          latestCost = m.total_cost_usd;
+          if (latestCost - lastEmittedCost > 0.03) emitCost();
+        }
+        if (m.subtype !== 'success') {
+          throw new Error(`Rebuilding site failed: the agent session ended with "${m.subtype}".`);
+        }
+        onLog(
+          `Rebuilding site — done in ${Math.round(m.duration_ms / 1000)}s` +
+            (m.total_cost_usd ? ` ($${m.total_cost_usd.toFixed(2)})` : ''),
+        );
       }
-    } else if (m.type === 'result') {
-      if (m.subtype !== 'success') {
-        throw new Error(`Rebuilding site failed: the agent session ended with "${m.subtype}".`);
-      }
-      onLog(
-        `Rebuilding site — done in ${Math.round(m.duration_ms / 1000)}s` +
-          (m.total_cost_usd ? ` ($${m.total_cost_usd.toFixed(2)})` : ''),
-      );
     }
+  } finally {
+    clearInterval(costTimer);
   }
 
   if (!qaStarted) onLog('Verifying against original — QA pass did not report in; check the build manually');
@@ -456,7 +478,7 @@ async function rebuild(
 
 // ---------------------------------------------------------------- public API
 
-export async function runClone(url: string, onLog: (line: string) => void): Promise<void> {
+export async function runClone(url: string, onLogOut: (line: string) => void): Promise<void> {
   let target: string;
   try {
     target = new URL(url).toString();
@@ -469,25 +491,41 @@ export async function runClone(url: string, onLog: (line: string) => void): Prom
   const sourceDir = path.join(siteDir, 'source');
   fs.mkdirSync(sourceDir, { recursive: true });
 
-  const links = await mapPages(target, onLog);
-  const pages = await crawlPages(pickPages(target, links), sourceDir, onLog);
-  const mobile = await captureMobile(pages, sourceDir, onLog);
+  // Append-mode: re-running the same domain adds to run.log rather than truncating it, so a
+  // history of past attempts survives.
+  const logStream = fs.createWriteStream(path.join(siteDir, 'run.log'), { flags: 'a' });
+  const onLog = (line: string) => {
+    logStream.write(`[${new Date().toISOString()}] ${line}\n`);
+    onLogOut(line);
+  };
 
-  if (process.env.CLONE_DRY_RUN) {
-    onLog('Dry run (CLONE_DRY_RUN=1) — stopping after capture.');
-    return;
+  try {
+    const links = await mapPages(target, onLog);
+    const pages = await crawlPages(pickPages(target, links), sourceDir, onLog);
+    const mobile = await captureMobile(pages, sourceDir, onLog);
+
+    if (process.env.CLONE_DRY_RUN) {
+      onLog('Dry run (CLONE_DRY_RUN=1) — stopping after capture.');
+      return;
+    }
+
+    await rebuild(target, siteDir, pages, mobile, onLog);
+
+    const appDir = path.join(siteDir, 'app');
+    onLog('Publishing local preview — building static export…');
+    const serve = await import('./serve.js').catch((err) => {
+      throw new Error(`Publishing local preview failed: could not load ./serve.ts — ${err?.message ?? err}`);
+    });
+    if (typeof serve.publishPreview !== 'function') {
+      throw new Error('Publishing local preview failed: ./serve.ts does not export publishPreview().');
+    }
+    const previewUrl = await serve.publishPreview(appDir, onLog);
+    onLog(`Publishing local preview → ${previewUrl}`);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    logStream.write(`[${new Date().toISOString()}] ERROR: ${message}\n`);
+    throw err;
+  } finally {
+    logStream.end();
   }
-
-  await rebuild(target, siteDir, pages, mobile, onLog);
-
-  const appDir = path.join(siteDir, 'app');
-  onLog('Publishing local preview — building static export…');
-  const serve = await import('./serve.js').catch((err) => {
-    throw new Error(`Publishing local preview failed: could not load ./serve.ts — ${err?.message ?? err}`);
-  });
-  if (typeof serve.publishPreview !== 'function') {
-    throw new Error('Publishing local preview failed: ./serve.ts does not export publishPreview().');
-  }
-  const previewUrl = await serve.publishPreview(appDir, onLog);
-  onLog(`Publishing local preview → ${previewUrl}`);
 }
