@@ -8,8 +8,12 @@ Assumes SETUP.md's droplet: Ubuntu 24.04, node from nodesource (`/usr/bin/npm`),
 `build`, checkout at `/home/build/website-clone`. Phase 4.1 (`HOSTED=1` support) must be
 committed and pulled first.
 
-Result: `https://<your-domain>/` is the clone UI, `https://<your-domain>/preview/<domain>/`
-is any finished clone. Both behind basic-auth. Nothing else is reachable.
+Result: `https://hello-dolly-gyds101.ianray.com/` is the clone UI,
+`https://hello-dolly-gyds101.ianray.com/preview/<domain>/` is any finished clone. Both behind
+basic-auth. Nothing else is reachable.
+
+DNS: before running certbot, create an A record for `hello-dolly-gyds101` (i.e.
+`hello-dolly-gyds101.ianray.com`) pointing at the droplet IP.
 
 ---
 
@@ -92,7 +96,7 @@ chmod o+x /home/build /home/build/website-clone /home/build/website-clone/sites
 ```nginx
 server {
     listen 80;
-    server_name clones.example.com;          # or the droplet IP — see TLS note below
+    server_name hello-dolly-gyds101.ianray.com;   # or the droplet IP — see TLS note below
 
     client_max_body_size 2m;
 
@@ -162,7 +166,7 @@ With a real domain (A record → droplet IP):
 
 ```bash
 apt-get install -y certbot python3-certbot-nginx
-certbot --nginx -d clones.example.com --redirect -m ian@ianray.com --agree-tos
+certbot --nginx -d hello-dolly-gyds101.ianray.com --redirect -m ian@ianray.com --agree-tos
 ```
 
 **Without a domain, there is no certificate** — basic-auth over plain HTTP sends the
@@ -208,7 +212,7 @@ rebase pass; re-running the clone from the UI applies it automatically, a manual
 ## 6. Smoke checklist
 
 ```bash
-H=clones.example.com; U=ian:<password>; D=<a-built-domain>
+H=hello-dolly-gyds101.ianray.com; U=ian:<password>; D=<a-built-domain>
 
 # UI answers through nginx, and only through nginx
 curl -sS -o /dev/null -w '%{http_code}\n' -u "$U" https://$H/                 # 200
