@@ -1,0 +1,7 @@
+node_modules/
+sites/
+logs/
+.done/
+*.log
+.env
+.env.*
