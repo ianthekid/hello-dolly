@@ -25,6 +25,73 @@ function killGroup(pgid: number, signal: NodeJS.Signals = "SIGTERM") {
   process.kill(-pgid, signal);
 }
 
+/** Tolerates the legacy bare-pgid format written by earlier code, alongside the current JSON one. */
+function readPidFile(file: string): { pgid: number; port: number | null } | null {
+  let raw: string;
+  try {
+    raw = readFileSync(file, "utf8").trim();
+  } catch {
+    return null;
+  }
+  if (!raw) return null;
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw);
+      const pgid = Number(parsed.pgid);
+      if (!pgid) return null;
+      return { pgid, port: typeof parsed.port === "number" ? parsed.port : null };
+    } catch {
+      return null;
+    }
+  }
+  const pgid = Number(raw);
+  return pgid ? { pgid, port: null } : null;
+}
+
+export type PreviewInfo = { domain: string; pgid: number; port: number | null; url: string | null; alive: boolean };
+
+/** Every live preview under `sites/`. Removes the pid file for any entry that is no longer alive. */
+export function listPreviews(root: string = process.cwd()): PreviewInfo[] {
+  const sitesDir = path.join(root, "sites");
+  const out: PreviewInfo[] = [];
+  if (!existsSync(sitesDir)) return out;
+  for (const site of readdirSync(sitesDir)) {
+    const pidFile = path.join(sitesDir, site, "app", PID_NAME);
+    if (!existsSync(pidFile)) continue;
+    const info = readPidFile(pidFile);
+    if (!info || !isAlive(info.pgid)) {
+      rmSync(pidFile, { force: true });
+      continue;
+    }
+    out.push({
+      domain: site,
+      pgid: info.pgid,
+      port: info.port,
+      url: info.port ? `http://localhost:${info.port}` : null,
+      alive: true,
+    });
+  }
+  return out;
+}
+
+/** Kills the preview's process group and removes its pid file. Returns whether anything was killed. */
+export function stopPreview(domain: string, root: string = process.cwd()): boolean {
+  const pidFile = path.join(root, "sites", domain, "app", PID_NAME);
+  if (!existsSync(pidFile)) return false;
+  const info = readPidFile(pidFile);
+  let killed = false;
+  if (info && isAlive(info.pgid)) {
+    try {
+      killGroup(info.pgid);
+      killed = true;
+    } catch {
+      // already gone
+    }
+  }
+  rmSync(pidFile, { force: true });
+  return killed;
+}
+
 function freePort(start: number): Promise<number> {
   return new Promise((resolve, reject) => {
     const tryPort = (port: number) => {
@@ -124,10 +191,10 @@ export async function publishPreview(
 
   const pidFile = path.join(appDir, PID_NAME);
   if (existsSync(pidFile)) {
-    const oldPgid = Number(readFileSync(pidFile, "utf8").trim());
-    if (oldPgid && isAlive(oldPgid)) {
+    const old = readPidFile(pidFile);
+    if (old && isAlive(old.pgid)) {
       try {
-        killGroup(oldPgid);
+        killGroup(old.pgid);
       } catch {
         // already gone
       }
@@ -180,7 +247,7 @@ export async function publishPreview(
   if (!child.pid) {
     throw new Error("Publishing local preview failed: spawned preview server has no pid.");
   }
-  writeFileSync(pidFile, String(child.pid));
+  writeFileSync(pidFile, JSON.stringify({ pgid: child.pid, port, startedAt: new Date().toISOString() }));
 
   const url = `http://localhost:${port}`;
   await waitFor200(`${url}/`, 15000);
@@ -189,23 +256,13 @@ export async function publishPreview(
 }
 
 if (process.argv[2] === "stop") {
-  const sitesDir = path.join(process.cwd(), "sites");
   let stopped = 0;
-  if (existsSync(sitesDir)) {
-    for (const site of readdirSync(sitesDir)) {
-      const pidFile = path.join(sitesDir, site, "app", PID_NAME);
-      if (!existsSync(pidFile)) continue;
-      const pgid = Number(readFileSync(pidFile, "utf8").trim());
-      if (pgid && isAlive(pgid)) {
-        try {
-          killGroup(pgid);
-          console.log(`stopped preview for ${site} (pgid ${pgid})`);
-          stopped++;
-        } catch (e) {
-          console.log(`failed to kill pgid ${pgid} for ${site}: ${e}`);
-        }
-      }
-      rmSync(pidFile, { force: true });
+  for (const p of listPreviews()) {
+    if (stopPreview(p.domain)) {
+      console.log(`stopped preview for ${p.domain} (pgid ${p.pgid})`);
+      stopped++;
+    } else {
+      console.log(`failed to kill pgid ${p.pgid} for ${p.domain}`);
     }
   }
   if (stopped === 0) console.log("no live previews found");

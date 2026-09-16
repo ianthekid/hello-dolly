@@ -1,6 +1,6 @@
 // Phase 1 pipeline: URL -> Firecrawl map/crawl/screenshots -> Agent SDK rebuild -> local preview.
 // Every one of the 6 canonical steps emits an onLog line starting with its exact step name.
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, type SDKMessage } from '@anthropic-ai/claude-agent-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -35,12 +35,36 @@ function headers() {
   return { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' };
 }
 
-async function firecrawl(endpoint: string, body: unknown): Promise<any> {
-  const res = await fetch(`${FIRECRAWL}${endpoint}`, {
-    method: 'POST',
-    headers: headers(),
-    body: JSON.stringify(body),
-  });
+/**
+ * One retry, after ~2s, for a Firecrawl HTTP call. Retries when the `fetch` promise *rejects*
+ * (no response at all — DNS, reset, "fetch failed") or the response is 429/5xx. Never retries
+ * any other 4xx: a bad key or a bad URL fails identically the second time, and the error
+ * message from the first attempt is what the operator needs to fix it.
+ *
+ * `/batch/scrape` is a POST and therefore not strictly idempotent — retrying it could start a
+ * duplicate Firecrawl job. Accepted: when the fetch rejected, no job handle ever came back, so
+ * there is nothing to poll and nothing to salvage from the first attempt anyway; a duplicate job
+ * costs credits, a dead run costs the whole crawl.
+ */
+async function fetchRetry(url: string, init: RequestInit, label: string, onLog: (l: string) => void): Promise<Response> {
+  try {
+    const res = await fetch(url, init);
+    if (res.status !== 429 && res.status < 500) return res;
+    onLog(`${label} failed (${res.status}), retrying in 2s…`);
+  } catch (err) {
+    onLog(`${label} failed (${err instanceof Error ? err.message : err}), retrying in 2s…`);
+  }
+  await new Promise((r) => setTimeout(r, 2000));
+  return fetch(url, init);
+}
+
+async function firecrawl(endpoint: string, body: unknown, onLog: (l: string) => void, stepPrefix: string): Promise<any> {
+  const res = await fetchRetry(
+    `${FIRECRAWL}${endpoint}`,
+    { method: 'POST', headers: headers(), body: JSON.stringify(body) },
+    `${stepPrefix} — Firecrawl ${endpoint}`,
+    onLog,
+  );
   const json = await res.json().catch(() => null);
   if (!res.ok || !json?.success) {
     throw new Error(`Firecrawl ${endpoint} failed (${res.status}): ${JSON.stringify(json).slice(0, 300)}`);
@@ -49,10 +73,14 @@ async function firecrawl(endpoint: string, body: unknown): Promise<any> {
 }
 
 /** Download a Firecrawl screenshot (URL or data: URI) to disk. */
-async function saveImage(src: string, file: string) {
-  const buf = src.startsWith('data:')
-    ? Buffer.from(src.slice(src.indexOf(',') + 1), 'base64')
-    : Buffer.from((await fetch(src).then((r) => r.arrayBuffer())) as ArrayBuffer);
+async function saveImage(src: string, file: string, onLog: (l: string) => void, stepPrefix: string) {
+  let buf: Buffer;
+  if (src.startsWith('data:')) {
+    buf = Buffer.from(src.slice(src.indexOf(',') + 1), 'base64');
+  } else {
+    const res = await fetchRetry(src, {}, `${stepPrefix} — screenshot download`, onLog);
+    buf = Buffer.from(await res.arrayBuffer());
+  }
   fs.writeFileSync(file, buf);
   return buf.length;
 }
@@ -60,7 +88,7 @@ async function saveImage(src: string, file: string) {
 // ---------------------------------------------------------------- step 1: map
 
 async function mapPages(target: string, onLog: (l: string) => void): Promise<string[]> {
-  const json = await firecrawl('/map', { url: target, limit: 100 });
+  const json = await firecrawl('/map', { url: target, limit: 100 }, onLog, 'Mapping pages');
   const links: string[] = (json.links ?? []).map((l: any) => (typeof l === 'string' ? l : l.url)).filter(Boolean);
   onLog(`Mapping pages… found ${links.length}`);
   return links;
@@ -153,7 +181,8 @@ async function pollBatchJob(jobUrl: string, label: string, onLog: (l: string) =>
   let job: any;
   for (;;) {
     await new Promise((r) => setTimeout(r, 5000));
-    job = await fetch(jobUrl, { headers: headers() }).then((r) => r.json());
+    const res = await fetchRetry(jobUrl, { headers: headers() }, `Extracting content — Firecrawl poll (${label})`, onLog);
+    job = await res.json();
     onLog(`Extracting content — ${label} ${job.completed ?? 0}/${job.total ?? '?'} pages`);
     if (job.status !== 'scraping') break;
   }
@@ -193,11 +222,21 @@ async function crawlPages(
   const innerUrls = urls.filter((u) => slug(u) !== 'home');
   const jobs: Promise<any[]>[] = [];
   if (homeUrls.length) {
-    const start = await firecrawl('/batch/scrape', { urls: homeUrls, ...BASE_SCRAPE_OPTIONS, onlyMainContent: false });
+    const start = await firecrawl(
+      '/batch/scrape',
+      { urls: homeUrls, ...BASE_SCRAPE_OPTIONS, onlyMainContent: false },
+      onLog,
+      'Extracting content',
+    );
     jobs.push(pollBatchJob(start.url, 'home', onLog));
   }
   if (innerUrls.length) {
-    const start = await firecrawl('/batch/scrape', { urls: innerUrls, ...BASE_SCRAPE_OPTIONS, onlyMainContent: true });
+    const start = await firecrawl(
+      '/batch/scrape',
+      { urls: innerUrls, ...BASE_SCRAPE_OPTIONS, onlyMainContent: true },
+      onLog,
+      'Extracting content',
+    );
     jobs.push(pollBatchJob(start.url, 'inner', onLog));
   }
   const data = (await Promise.all(jobs)).flat();
@@ -212,7 +251,7 @@ async function crawlPages(
     fs.writeFileSync(path.join(sourceDir, `${name}.md`), d.markdown ?? '');
     let shot: string | null = null;
     if (d.screenshot) {
-      await saveImage(d.screenshot, path.join(sourceDir, `${name}.png`));
+      await saveImage(d.screenshot, path.join(sourceDir, `${name}.png`), onLog, 'Extracting content');
       shot = `${name}.png`;
     }
     pages.push({ url, title: d.metadata?.title ?? name, md: `${name}.md`, screenshot: shot });
@@ -245,14 +284,15 @@ async function captureMobile(
       continue;
     }
     try {
-      const json = await firecrawl('/scrape', {
-        url: p.url,
-        mobile: true,
-        formats: [{ type: 'screenshot', fullPage: true }],
-      });
+      const json = await firecrawl(
+        '/scrape',
+        { url: p.url, mobile: true, formats: [{ type: 'screenshot', fullPage: true }] },
+        onLog,
+        'Capturing design',
+      );
       const src = json.data?.screenshot;
       if (!src) throw new Error('no screenshot in response');
-      await saveImage(src, dest);
+      await saveImage(src, dest, onLog, 'Capturing design');
       shots.push({ page: p, file });
       onLog(`Capturing design — mobile ${name}`);
     } catch (err) {
@@ -658,6 +698,12 @@ function scaffold(siteDir: string, onLog: (l: string) => void) {
   );
 }
 
+function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
 async function rebuild(
   target: string,
   siteDir: string,
@@ -679,19 +725,30 @@ async function rebuild(
     onLog(line);
   };
 
-  // Live cost: the SDK only guarantees total_cost_usd on 'result' messages, so track the
-  // latest one we've seen and surface it at most every ~30s or on a several-cent jump —
-  // whichever comes first — rather than only in the one summary line at the end.
-  let latestCost = 0;
-  let lastEmittedCost = 0;
-  const emitCost = () => {
-    if (latestCost <= 0) return;
-    lastEmittedCost = latestCost;
-    onLog(`Rebuilding site — $${latestCost.toFixed(2)} so far`);
+  // Live progress: total_cost_usd only ever lands on the session's terminal result (the SDK's
+  // own doc: "exactly one result message per turn"), so it can't tick during the run — the only
+  // per-message signal available mid-rebuild is the token usage each Task subagent (page-builder,
+  // qa) reports on task_progress/task_notification. Track the latest total per task (these report
+  // that task's running total, not a delta) and surface the sum at most every ~30s. Dollars stay
+  // exact-only, from the terminal result once the loop ends.
+  const taskTokens = new Map<string, number>();
+  let latestTokens = 0;
+  let lastEmittedTokens = 0;
+  const emitTokens = () => {
+    if (latestTokens <= 0) return;
+    lastEmittedTokens = latestTokens;
+    onLog(`Rebuilding site — ~${formatTokenCount(latestTokens)} tokens so far`);
   };
-  const costTimer = setInterval(() => {
-    if (latestCost !== lastEmittedCost) emitCost();
+  const progressTimer = setInterval(() => {
+    if (latestTokens !== lastEmittedTokens) emitTokens();
   }, 30_000);
+
+  // The stream's LAST 'result' message is the session's own terminal result by definition; any
+  // 'result' superseded by a later one turns out to have belonged to a nested subagent, not the
+  // session. So only report done/throw once the loop ends and we know which one that was —
+  // otherwise every subagent completion re-broadcasts "done", and one failed subagent (a
+  // non-'success' subtype) aborts the whole rebuild.
+  let finalResult: Extract<SDKMessage, { type: 'result' }> | null = null;
 
   try {
     for await (const m of query({
@@ -735,22 +792,30 @@ async function rebuild(
           const line = describeTool(b.name, b.input);
           if (line) log(line);
         }
+      } else if (m.type === 'system' && (m.subtype === 'task_progress' || m.subtype === 'task_notification')) {
+        if (m.usage) {
+          taskTokens.set(m.task_id, m.usage.total_tokens);
+          latestTokens = [...taskTokens.values()].reduce((sum, n) => sum + n, 0);
+        }
       } else if (m.type === 'result') {
-        if (typeof m.total_cost_usd === 'number' && m.total_cost_usd > 0) {
-          latestCost = m.total_cost_usd;
-          if (latestCost - lastEmittedCost > 0.03) emitCost();
+        if (finalResult && finalResult.subtype !== 'success') {
+          onLog(`Rebuilding site — a page builder ended with "${finalResult.subtype}"`);
         }
-        if (m.subtype !== 'success') {
-          throw new Error(`Rebuilding site failed: the agent session ended with "${m.subtype}".`);
-        }
-        onLog(
-          `Rebuilding site — done in ${Math.round(m.duration_ms / 1000)}s` +
-            (m.total_cost_usd ? ` ($${m.total_cost_usd.toFixed(2)})` : ''),
-        );
+        finalResult = m;
       }
     }
   } finally {
-    clearInterval(costTimer);
+    clearInterval(progressTimer);
+  }
+
+  if (finalResult) {
+    if (finalResult.subtype !== 'success') {
+      throw new Error(`Rebuilding site failed: the agent session ended with "${finalResult.subtype}".`);
+    }
+    onLog(
+      `Rebuilding site — done in ${Math.round(finalResult.duration_ms / 1000)}s` +
+        (finalResult.total_cost_usd ? ` ($${finalResult.total_cost_usd.toFixed(2)})` : ''),
+    );
   }
 
   if (!qaStarted) onLog('Verifying against original — QA pass did not report in; check the build manually');

@@ -155,13 +155,16 @@ const PAGE = `<!doctype html>
   ul#steps li.pending::before { content: "○ "; }
   #log { background: #f6f8fa; border: 1px solid #ddd; border-radius: 4px; padding: 0.75rem; height: 220px; overflow-y: auto; font-family: monospace; font-size: 0.85rem; white-space: pre-wrap; }
   #error { color: #cb2431; margin-top: 0.5rem; }
-  #review, #confirm { display: none; border: 1px solid #ddd; border-radius: 4px; padding: 0.75rem; margin: 0.75rem 0; }
-  #review h2, #confirm h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+  #review, #confirm, #previews { display: none; border: 1px solid #ddd; border-radius: 4px; padding: 0.75rem; margin: 0.75rem 0; }
+  #review h2, #confirm h2, #previews h2 { font-size: 1rem; margin: 0 0 0.5rem; }
   #review ul { list-style: none; padding: 0; margin: 0 0 0.5rem; max-height: 220px; overflow-y: auto; }
   #review li { padding: 0.15rem 0; }
   #review .filtered { color: #999; font-size: 0.85rem; }
   #review .actions, #confirm .actions { margin-top: 0.5rem; }
   #review .actions button, #confirm .actions button { margin-right: 0.5rem; }
+  #previews ul { list-style: none; padding: 0; margin: 0; }
+  #previews li { display: flex; align-items: center; justify-content: space-between; padding: 0.2rem 0; }
+  #previews li button { margin-left: 0.75rem; }
   #stop { margin-left: 0.5rem; }
 </style>
 </head>
@@ -174,6 +177,7 @@ const PAGE = `<!doctype html>
 <div id="review"></div>
 <div id="confirm"></div>
 <div id="log"></div>
+<div id="previews"></div>
 <div id="error"></div>
 <script>
 const STEPS = ${JSON.stringify(STEPS)};
@@ -185,7 +189,52 @@ const goEl = document.getElementById('go');
 const stopEl = document.getElementById('stop');
 const reviewEl = document.getElementById('review');
 const confirmEl = document.getElementById('confirm');
+const previewsEl = document.getElementById('previews');
 let currentJobId = null;
+
+async function refreshPreviews() {
+  let previews;
+  try {
+    const res = await fetch('/api/previews');
+    previews = await res.json();
+  } catch (e) {
+    return;
+  }
+  if (!Array.isArray(previews) || !previews.length) {
+    previewsEl.style.display = 'none';
+    previewsEl.innerHTML = '';
+    return;
+  }
+  previewsEl.innerHTML = '';
+  previewsEl.style.display = 'block';
+  const h2 = document.createElement('h2');
+  h2.textContent = 'Running previews';
+  previewsEl.appendChild(h2);
+  const list = document.createElement('ul');
+  previews.forEach((p) => {
+    const li = document.createElement('li');
+    const a = document.createElement('a');
+    a.href = p.url || '#';
+    a.target = '_blank';
+    a.textContent = p.domain + ' — ' + (p.url || 'no port on record');
+    li.appendChild(a);
+    const stopBtn = document.createElement('button');
+    stopBtn.textContent = 'Stop';
+    stopBtn.addEventListener('click', async () => {
+      stopBtn.disabled = true;
+      try {
+        await fetch('/api/previews/' + encodeURIComponent(p.domain) + '/stop', { method: 'POST' });
+      } catch (e) {
+        // ignore — refreshPreviews below shows whatever the current state actually is
+      }
+      refreshPreviews();
+    });
+    li.appendChild(stopBtn);
+    list.appendChild(li);
+  });
+  previewsEl.appendChild(list);
+}
+refreshPreviews();
 
 function hideReview() {
   reviewEl.style.display = 'none';
@@ -383,6 +432,7 @@ function attachJob(id) {
     stopEl.disabled = true;
     currentJobId = null;
     es.close();
+    refreshPreviews();
   });
   es.addEventListener('error', (e) => {
     // Named "event: error" messages carry .data; transport-level errors don't.
@@ -654,6 +704,48 @@ const server = createServer(async (req, res) => {
     stopJob(job, 'Stopped by user');
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (req.method === 'GET' && url.pathname === '/api/previews') {
+    try {
+      const serve = await import('./serve.js');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(serve.listPreviews()));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Could not load ./serve.ts — ${err instanceof Error ? err.message : err}` }));
+    }
+    return;
+  }
+
+  const previewStopMatch = url.pathname.match(/^\/api\/previews\/([^/]+)\/stop$/);
+  if (req.method === 'POST' && previewStopMatch) {
+    let domain: string;
+    try {
+      domain = decodeURIComponent(previewStopMatch[1]);
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid domain' }));
+      return;
+    }
+    try {
+      const serve = await import('./serve.js');
+      // Membership in listPreviews()'s own domain set, never a path built from the request —
+      // a ../../ segment just fails to match and 404s instead of resolving anywhere.
+      const live = serve.listPreviews();
+      if (!live.some((p) => p.domain === domain)) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'No live preview for this domain' }));
+        return;
+      }
+      serve.stopPreview(domain);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Could not load ./serve.ts — ${err instanceof Error ? err.message : err}` }));
+    }
     return;
   }
 
