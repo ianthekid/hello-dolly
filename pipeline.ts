@@ -4,6 +4,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import sharp from 'sharp';
 
 try {
   process.loadEnvFile('.env');
@@ -16,6 +17,12 @@ type Page = { url: string; title: string; md: string; screenshot: string | null 
 const FIRECRAWL = 'https://api.firecrawl.dev/v2';
 const MAX_PAGES = 30;
 const MOBILE_SHOTS = 3;
+// Full-page screenshots are ~1920x7000; read whole they are downscaled until the copy is
+// unreadable. Slice them into viewport-height tiles at capture time so the agent never has to
+// build itself a cropper. The overlap keeps a heading that lands on a boundary whole in one tile.
+const TILE_HEIGHT = 1080;
+const TILE_OVERLAP = 120;
+const MAX_TILES = 12;
 
 const slug = (url: string) => {
   const p = new URL(url).pathname.replace(/^\/|\/$/g, '');
@@ -256,6 +263,101 @@ async function captureMobile(
   return shots;
 }
 
+// ------------------------------------------- step 3: screenshot tiling
+
+/** This page's tile files, sorted numerically (tile 10 after tile 2, not before it). */
+function existingTiles(tilesDir: string, name: string): string[] {
+  return fs
+    .readdirSync(tilesDir)
+    .map((f) => ({ f, n: tileIndex(f, name) }))
+    .filter((t) => t.n > 0)
+    .sort((a, b) => a.n - b.n)
+    .map((t) => t.f);
+}
+
+/** 1-based tile number of `<name>-<n>.png`, or 0 if the file is not a tile of `name`. */
+function tileIndex(file: string, name: string): number {
+  if (!file.startsWith(`${name}-`) || !file.endsWith('.png')) return 0;
+  const mid = file.slice(name.length + 1, -'.png'.length);
+  return /^\d+$/.test(mid) ? Number(mid) : 0;
+}
+
+/** Top offsets of every tile covering an image `height` px tall, plus whether the tail was cut. */
+function tileOffsets(height: number): { tops: number[]; truncated: boolean } {
+  const step = Math.max(1, TILE_HEIGHT - TILE_OVERLAP);
+  const tops: number[] = [];
+  for (let top = 0; top < height; top += step) {
+    // A trailing sliver shorter than the overlap is already fully inside the previous tile.
+    if (tops.length && height - top <= TILE_OVERLAP) break;
+    tops.push(top);
+  }
+  if (!tops.length) tops.push(0);
+  const truncated = tops.length > MAX_TILES;
+  return { tops: truncated ? tops.slice(0, MAX_TILES) : tops, truncated };
+}
+
+/**
+ * Slice every desktop screenshot into readable, viewport-height tiles under `source/tiles/`.
+ * Returned paths are relative to the SITE dir (`source/tiles/<name>-1.png`) because that is the
+ * agent's cwd — note pages.json stores `screenshot` relative to `source/` instead. Best-effort:
+ * a page that fails to tile comes back with no tiles and the prompt falls back to its full PNG.
+ */
+async function tileScreenshots(
+  pages: Page[],
+  sourceDir: string,
+  onLog: (l: string) => void,
+): Promise<{ page: Page; tiles: string[] }[]> {
+  const shot = pages.filter((p) => p.screenshot);
+  if (!shot.length) return [];
+  const tilesDir = path.join(sourceDir, 'tiles');
+  fs.mkdirSync(tilesDir, { recursive: true });
+  onLog(`Capturing design — slicing ${shot.length} screenshots into readable tiles…`);
+
+  const out: { page: Page; tiles: string[] }[] = [];
+  for (const p of shot) {
+    const name = p.md.replace(/\.md$/, '');
+    const src = path.join(sourceDir, p.screenshot as string);
+    const rel = (file: string) => path.posix.join('source', 'tiles', file);
+    try {
+      const srcMtime = fs.statSync(src).mtimeMs;
+      const cached = existingTiles(tilesDir, name);
+      if (cached.length && fs.statSync(path.join(tilesDir, cached[0])).mtimeMs >= srcMtime) {
+        onLog(`Capturing design — tiles for ${name} cached`);
+        out.push({ page: p, tiles: cached.map(rel) });
+        continue;
+      }
+      // Stale tiles from an older, taller screenshot would otherwise survive as phantom slices.
+      for (const file of cached) fs.rmSync(path.join(tilesDir, file), { force: true });
+
+      const { width, height } = await sharp(src).metadata();
+      if (!width || !height) throw new Error('could not read the image dimensions');
+      const { tops, truncated } = tileOffsets(height);
+      const tiles: string[] = [];
+      for (const [i, top] of tops.entries()) {
+        const file = `${name}-${i + 1}.png`;
+        await sharp(src)
+          .extract({ left: 0, top, width, height: Math.min(TILE_HEIGHT, height - top) })
+          .png()
+          .toFile(path.join(tilesDir, file));
+        tiles.push(rel(file));
+      }
+      out.push({ page: p, tiles });
+      onLog(
+        `Capturing design — tiled ${name} into ${tiles.length} slice${tiles.length === 1 ? '' : 's'}` +
+          (truncated ? ` (capped at ${MAX_TILES}; the bottom of the page was skipped)` : ''),
+      );
+    } catch (err) {
+      // Tiling is a readability aid: losing it costs fidelity, not the run.
+      onLog(
+        `Capturing design — tiling ${name} failed (${err instanceof Error ? err.message : err}), ` +
+          'using the full screenshot',
+      );
+      out.push({ page: p, tiles: [] });
+    }
+  }
+  return out;
+}
+
 // ------------------------------------------------- tool_use -> log line table
 
 const BASENAME = (f: string) => path.basename(f ?? '');
@@ -283,7 +385,8 @@ function describeTool(name: string, input: any): string | null {
   if (name === 'WebFetch') return 'Reading the original site’s CSS…';
 
   if (name === 'Read' && /\.png$/i.test(file)) {
-    return `Studying design: ${BASENAME(file).replace(/\.png$/i, '')}…`;
+    // Drop a tile's trailing -<n> so all 7 tiles of one page collapse into one line in the UI.
+    return `Studying design: ${BASENAME(file).replace(/\.png$/i, '').replace(/-\d+$/, '')}…`;
   }
 
   if (name === 'Write' || name === 'Edit' || name === 'MultiEdit') {
@@ -309,14 +412,19 @@ const QA_MARKER = 'QA_PASS_START';
 
 const pageBuilderPrompt = `You build ONE page of a website clone as part of a larger rebuild.
 
-You are given: the page's route, its source markdown file, and its full-page desktop screenshot
-(and sometimes a mobile screenshot). Before you write anything, read \`source/design-tokens.md\`
-with the Read tool — it is the shared design-tokens note for the whole site.
+You are given: the page's route, its source markdown file, and its desktop screenshot as a list of
+\`source/tiles/<name>-N.png\` tiles — full-resolution, viewport-height slices of the page, 1-indexed
+top to bottom (and sometimes a mobile screenshot). Before you write anything, read
+\`source/design-tokens.md\` with the Read tool — it is the shared design-tokens note for the site.
 
 Rules:
-- The screenshot is the spec; the markdown is the content. Read the PNG with the Read tool and
-  look at it. Take every word of copy verbatim from the markdown. No lorem ipsum, no
+- The screenshot is the spec; the markdown is the content. Read the tiles in order with the Read
+  tool and look at them — they are the page top to bottom at full resolution. Take every word of
+  copy verbatim from the markdown. No lorem ipsum, no
   "Service description here", no invented names. If the original has 12 testimonials, build 12.
+- The tiles already exist and are final. Do NOT crop, resize, convert or otherwise process any
+  image; do NOT write a cropping or slicing script; do NOT install or invoke ffmpeg, ImageMagick,
+  sips or any other image tool. Read the tiles you were given; that is the entire workflow.
 - Use ONLY the tokens, fonts, colors and utility classes from the design-tokens note, and the
   existing shared Header/Footer/layout components. Do NOT create your own header or footer,
   do NOT redefine fonts or colors, do NOT edit globals.css or layout.tsx or any shared component.
@@ -351,24 +459,38 @@ tool's own UI) and kill your server before you finish reporting.
 
 Report: routes built, build status, hot-link count (must be 0), and anything you could not fix.`;
 
-function orchestratorPrompt(target: string, pages: Page[], mobile: { page: Page; file: string }[]) {
+function orchestratorPrompt(
+  target: string,
+  pages: Page[],
+  mobile: { page: Page; file: string }[],
+  tiles: { page: Page; tiles: string[] }[],
+) {
   const mobileFor = (p: Page) => mobile.find((m) => m.page.url === p.url)?.file;
+  const tileCount = (p: Page) => tiles.find((t) => t.page.url === p.url)?.tiles.length ?? 0;
+  // The naming rule is spelled out once, in the source/ inventory above; the page list carries
+  // only the range. A page whose tiling failed falls back to its one full-page PNG.
+  const shotsFor = (p: Page) => {
+    const n = tileCount(p);
+    return n ? `source/tiles/${p.md.replace(/\.md$/, '')}-1..${n}.png` : p.screenshot ?? 'NO SCREENSHOT';
+  };
   return `You are cloning the live website ${target} into a Next.js 15 + Tailwind v4 static site.
 
 Everything extracted for you is in \`source/\` (relative to your cwd):
 - \`source/pages.json\` — index of every crawled page: { url, title, md, screenshot }
 - \`source/<name>.md\` — full-page markdown (nav, body, footer, all link hrefs, all image URLs)
-- \`source/<name>.png\` — FULL-PAGE DESKTOP screenshot. These are images. READ THEM with the Read
-  tool. They are your design source of truth.
+- \`source/tiles/<name>-N.png\` — that page's DESKTOP screenshot, PRE-CROPPED FOR YOU into
+  full-resolution, viewport-height slices, 1-indexed top to bottom (\`-1\` is the top of the page,
+  and the page list below gives each page's tile count). READ THESE with the Read tool, in order.
+  They are your design source of truth.
+- \`source/<name>.png\` — the same desktop screenshot as one tall image. Use it only for a page the
+  list below shows with no tiles: read whole it is downscaled until the body copy is unreadable.
 - \`source/<name>.mobile.png\` — full-page MOBILE (390px) screenshot for a few key pages.
 
 Pages to rebuild (${pages.length}):
 ${pages
   .map(
     (p) =>
-      `- ${p.url} -> ${p.md} / ${p.screenshot ?? 'NO SCREENSHOT'}${
-        mobileFor(p) ? ` / ${mobileFor(p)}` : ''
-      } — ${p.title}`,
+      `- ${p.url} -> ${p.md} / ${shotsFor(p)}${mobileFor(p) ? ` / ${mobileFor(p)}` : ''} — ${p.title}`,
   )
   .join('\n')}
 
@@ -377,12 +499,15 @@ Your output goes in \`app/\`. Create the whole project there.
 ## Ground rules
 
 1. **The screenshots are the spec, the markdown is the content.** Never invent layout from the
-   markdown alone — open the PNG and look at it. Never invent copy from the screenshot — take
-   verbatim text from the markdown. Both, for every page.
-2. **Real content only.** Every heading, paragraph, service description, testimonial, phone
+   markdown alone — read that page's tiles in order and look at them. Never invent copy from the
+   screenshot — take verbatim text from the markdown. Both, for every page.
+2. **The tiles are already cropped for you.** Do NOT crop, resize, convert or otherwise process any
+   image; do NOT write a cropping or slicing script; do NOT install or invoke ffmpeg, ImageMagick,
+   sips or any other image tool. Reading the tiles with the Read tool is the entire workflow.
+3. **Real content only.** Every heading, paragraph, service description, testimonial, phone
    number, address and hours block is verbatim from the markdown. No lorem ipsum, no placeholder
    names. If the original page has 12 testimonials, build 12.
-3. **Real images, downloaded locally.** Download every referenced image into \`app/public/\`
+4. **Real images, downloaded locally.** Download every referenced image into \`app/public/\`
    (\`curl -sL '<original url>' -o app/public/<descriptive-name>.<ext>\`) and reference it as
    \`/<descriptive-name>.<ext>\`. NEVER hot-link the original domain — no \`src\`, \`srcset\`,
    \`<link rel="preload">\` or CSS \`url()\` may point at ${new URL(target).hostname}. Same for fonts:
@@ -432,7 +557,11 @@ Task tool. **Send all of them in a single message so they run in parallel.**
 Each delegation prompt must contain, inline:
 - the route to create (preserve the original pathname: \`/services/service\` ->
   \`src/app/services/service/page.tsx\`), and the page title for \`metadata\`;
-- the source file names: \`source/<name>.md\`, \`source/<name>.png\`, and the \`.mobile.png\` if listed above;
+- the source file names: \`source/<name>.md\`, and that page's tile paths spelled out in order
+  (\`source/tiles/<name>-1.png\`, \`source/tiles/<name>-2.png\`, … up to the count in the page list
+  above) the same way you pass \`source/design-tokens.md\` — a path, not its contents. Only if the
+  page list shows that page with no tiles, pass \`source/<name>.png\` instead. Plus the
+  \`.mobile.png\` if listed above;
 - the path \`source/design-tokens.md\` and an instruction to read it with the Read tool before
   writing anything (subagents do not share your context, so they must read it themselves — do not
   paste its contents);
@@ -462,6 +591,7 @@ async function rebuild(
   siteDir: string,
   pages: Page[],
   mobile: { page: Page; file: string }[],
+  tiles: { page: Page; tiles: string[] }[],
   onLog: (l: string) => void,
   abortController?: AbortController,
 ) {
@@ -492,7 +622,7 @@ async function rebuild(
 
   try {
     for await (const m of query({
-      prompt: orchestratorPrompt(target, pages, mobile),
+      prompt: orchestratorPrompt(target, pages, mobile, tiles),
       options: {
         cwd: siteDir,
         model: 'opus',
@@ -644,6 +774,8 @@ export async function runClone(
     assertNotAborted(signal);
     const mobile = await captureMobile(pages, sourceDir, onLog);
     assertNotAborted(signal);
+    const tiles = await tileScreenshots(pages, sourceDir, onLog);
+    assertNotAborted(signal);
 
     if (process.env.CLONE_DRY_RUN) {
       onLog('Dry run (CLONE_DRY_RUN=1) — stopping after capture.');
@@ -679,7 +811,7 @@ export async function runClone(
       }
     }
 
-    await rebuild(target, siteDir, buildPages, mobile, onLog, options?.abortController);
+    await rebuild(target, siteDir, buildPages, mobile, tiles, onLog, options?.abortController);
 
     const appDir = path.join(siteDir, 'app');
     onLog('Publishing local preview — building static export…');
