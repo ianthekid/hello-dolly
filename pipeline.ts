@@ -662,7 +662,9 @@ const SCAFFOLD_NEXT_CONFIG = `export default { output: 'export', images: { unopt
 // before comparing against it.
 function nextConfigFor(domain: string): string {
   if (!hosted()) return SCAFFOLD_NEXT_CONFIG;
-  return `export default { output: 'export', images: { unoptimized: true }, basePath: '/preview/${domain}' };\n`;
+  // trailingSlash keeps the home <Link>'s RSC fetch at <basePath>/index.txt instead of
+  // <basePath>.txt (which 404s and hard-navigates the browser to the .txt URL).
+  return `export default { output: 'export', images: { unoptimized: true }, basePath: '/preview/${domain}', trailingSlash: true };\n`;
 }
 
 const SCAFFOLD_POSTCSS_CONFIG = `export default { plugins: { '@tailwindcss/postcss': {} } };\n`;
