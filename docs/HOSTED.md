@@ -120,6 +120,19 @@ server {
     }
 
     # --- finished clones, served straight off disk. Zero-touch for new domains. ---
+
+    # Next's client router fetches the home page's RSC payload as /preview/<domain>.txt:
+    # the dot in the domain makes its trailing-slash normalizer treat the basePath as a
+    # file, so it never asks for /preview/<domain>/index.txt. Serve the real file via an
+    # internal rewrite (a redirect would make Next hard-navigate to the .txt URL).
+    # Must stay ABOVE the ^/preview/([^/]+)$ location — regex locations match in order.
+    location ~ ^/preview/(?<dom>[^/]+)\.txt$ {
+        auth_basic "website-clone";
+        auth_basic_user_file /etc/nginx/.htpasswd;
+        root /home/build/website-clone/sites/$dom/app/out;
+        rewrite .* /index.txt break;
+    }
+
     location ~ ^/preview/(?<dom>[^/]+)$ {
         return 301 /preview/$dom/;
     }
